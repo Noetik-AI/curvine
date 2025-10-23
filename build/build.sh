@@ -68,7 +68,7 @@ get_fuse_version() {
   elif command -v fusermount > /dev/null 2>&1; then
       echo "fuse2"
   else
-      echo ""  # No FUSE available
+      echo "fuse3"  # No FUSE available
   fi
 }
 

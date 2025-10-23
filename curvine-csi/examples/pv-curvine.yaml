@@ -5,7 +5,7 @@ metadata:
   labels:
     type: curvine
 spec:
-  storageClassName: curvine-sc
+  storageClassName: ""
   capacity:
     storage: 10Gi
   accessModes:

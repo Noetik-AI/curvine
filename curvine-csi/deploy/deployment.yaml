@@ -30,6 +30,8 @@ spec:
             - --endpoint=$(CSI_ENDPOINT)
             - --nodeid=$(NODE_NAME)
           env:
+            - name: RUST_LOG
+              value: debug
             - name: CSI_ENDPOINT
               value: unix:///csi/csi.sock
             - name: NODE_NAME
@@ -70,7 +72,7 @@ spec:
           env:
             - name: ADDRESS
               value: /csi/csi.sock
-          image: quay.io/k8scsi/csi-provisioner:v1.6.0
+          image: registry.k8s.io/sig-storage/csi-provisioner:v5.2.0
           name: csi-provisioner
           volumeMounts:
             - mountPath: /csi

@@ -21,7 +21,6 @@ use crate::*;
 use crate::{err_fuse, FuseError, FuseResult, FuseUtils};
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_common::conf::{ClusterConf, FuseConf};
-use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, Path};
 use curvine_common::state::{
     CreateFileOptsBuilder, FileAllocMode, FileAllocOpts, FileLock, FileStatus, LockFlags, LockType,
@@ -586,7 +585,7 @@ impl fs::FileSystem for CurvineFileSystem {
             );
         }
 
-        let mut out_flags = FUSE_BIG_WRITES
+        let mut init_flags: u64 = (FUSE_BIG_WRITES
             | FUSE_ASYNC_READ
             | FUSE_ASYNC_DIO
             | FUSE_SPLICE_MOVE
@@ -597,8 +596,15 @@ impl fs::FileSystem for CurvineFileSystem {
         let max_write = FuseUtils::get_fuse_buf_size() - FUSE_BUFFER_HEADER_SIZE;
         let page_size = sys::get_pagesize()?;
         let max_pages = if op.arg.flags & FUSE_MAX_PAGES != 0 {
-            out_flags |= FUSE_MAX_PAGES;
+            init_flags |= FUSE_MAX_PAGES as u64;
             (max_write - 1) / page_size + 1
+        } else {
+            0
+        };
+        let out_flags = op.arg.flags | init_flags as u32;
+        let high_flag_mask = (init_flags >> 32) as u32;
+        let out_flags2 = if supports_init_ext {
+            op.flags2 & high_flag_mask
         } else {
             0
         };
@@ -623,9 +629,15 @@ impl fs::FileSystem for CurvineFileSystem {
             #[cfg(feature = "fuse3")]
             max_pages: max_pages as u16,
             #[cfg(feature = "fuse3")]
-            padding: 0,
+            map_alignment: 0,
             #[cfg(feature = "fuse3")]
-            unused: 0,
+            flags2: out_flags2,
+            #[cfg(feature = "fuse3")]
+            max_stack_depth: 0,
+            #[cfg(feature = "fuse3")]
+            request_timeout: 0,
+            #[cfg(feature = "fuse3")]
+            unused: [0; 11],
         };
 
         Ok(out)
