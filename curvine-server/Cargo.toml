@@ -9,6 +9,7 @@ license.workspace = true
 [features]
 default = []
 jni = ["curvine-ufs/jni"]
+rdma = ["curvine-common/rdma", "fabric-lib", "cuda-lib"]
 
 [dependencies]
 orpc = { workspace = true }
@@ -46,6 +47,10 @@ rand = { workspace = true }
 url = { workspace = true }
 parking_lot = { workspace = true }
 lru = { workspace = true }
+
+# RDMA support
+fabric-lib = { path = "../../pplx-garden/fabric-lib", optional = true, features = ["tokio"] }
+cuda-lib = { path = "../../pplx-garden/rust/cuda-lib", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 curvine-s3-gateway = { workspace = true }

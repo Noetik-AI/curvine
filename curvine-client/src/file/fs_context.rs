@@ -47,6 +47,8 @@ pub struct FsContext {
     pub(crate) os_cache: CacheManager,
     pub(crate) failed_workers: Cache<u32, WorkerAddress, BuildHasherDefault<FxHasher>>,
     pub(crate) block_pool: Arc<BlockClientPool>,
+    #[cfg(feature = "rdma")]
+    pub(crate) rdma_manager: Option<Arc<crate::rdma::ClientRdmaManager>>,
 }
 
 impl FsContext {
@@ -95,6 +97,27 @@ impl FsContext {
             conf.client.block_conn_idle_time.as_millis() as u64,
         ));
 
+        #[cfg(feature = "rdma")]
+        let rdma_manager = if conf.client.rdma.enable_rdma {
+            match crate::rdma::ClientRdmaManager::new(
+                conf.client.rdma.rdma_num_domains,
+                conf.client.rdma.rdma_pin_worker_cpu,
+                conf.client.rdma.rdma_pin_uvm_cpu,
+                conf.client.rdma.rdma_memory_pool_mb,
+            ) {
+                Ok(manager) => {
+                    log::info!("Client RDMA enabled");
+                    Some(Arc::new(manager))
+                }
+                Err(e) => {
+                    warn!("Failed to initialize client RDMA (fallback to TCP): {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let context = Self {
             conf,
             connector: Arc::new(connector),
@@ -102,6 +125,8 @@ impl FsContext {
             os_cache,
             failed_workers: exclude_workers,
             block_pool,
+            #[cfg(feature = "rdma")]
+            rdma_manager,
         };
         Ok(context)
     }
@@ -140,6 +165,21 @@ impl FsContext {
 
     pub fn read_chunk_size(&self) -> usize {
         self.conf.client.read_chunk_size
+    }
+
+    #[cfg(feature = "rdma")]
+    pub fn rdma_manager(&self) -> Option<&Arc<crate::rdma::ClientRdmaManager>> {
+        self.rdma_manager.as_ref()
+    }
+
+    #[cfg(feature = "rdma")]
+    pub fn has_rdma(&self) -> bool {
+        self.rdma_manager.is_some()
+    }
+
+    #[cfg(not(feature = "rdma"))]
+    pub fn has_rdma(&self) -> bool {
+        false
     }
 
     pub fn read_chunk_num(&self) -> usize {

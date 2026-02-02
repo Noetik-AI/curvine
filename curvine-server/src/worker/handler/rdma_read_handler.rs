@@ -1,0 +1,271 @@
+// Copyright 2025 OPPO.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! RDMA-enabled block read handler
+
+#[cfg(feature = "rdma")]
+use crate::worker::rdma::TransferEngineManager;
+use crate::worker::block::BlockStore;
+use crate::worker::handler::ReadContext;
+use crate::worker::{Worker, WorkerMetrics};
+use curvine_common::error::FsError;
+use curvine_common::proto::BlockReadResponse;
+use curvine_common::FsResult;
+use log::{info, warn};
+use orpc::handler::MessageHandler;
+use orpc::message::{Builder, Message, RequestStatus};
+use orpc::{err_box, try_option_mut};
+use std::sync::Arc;
+
+/// RDMA-enabled read handler
+pub struct RdmaReadHandler {
+    pub(crate) store: BlockStore,
+    #[cfg(feature = "rdma")]
+    pub(crate) rdma_manager: Option<Arc<TransferEngineManager>>,
+    pub(crate) context: Option<ReadContext>,
+    pub(crate) metrics: &'static WorkerMetrics,
+    pub(crate) rdma_inline_threshold: usize,
+}
+
+impl RdmaReadHandler {
+    #[cfg(feature = "rdma")]
+    pub fn new(store: BlockStore, rdma_manager: Option<Arc<TransferEngineManager>>) -> Self {
+        let metrics = Worker::get_metrics();
+        let conf = Worker::get_conf();
+        Self {
+            store,
+            rdma_manager,
+            context: None,
+            metrics,
+            rdma_inline_threshold: conf.worker.rdma.rdma_inline_threshold,
+        }
+    }
+
+    #[cfg(not(feature = "rdma"))]
+    pub fn new(store: BlockStore) -> Self {
+        let metrics = Worker::get_metrics();
+        Self {
+            store,
+            context: None,
+            metrics,
+            rdma_inline_threshold: 65536,
+        }
+    }
+
+    /// Check if RDMA should be used for this request
+    #[cfg(feature = "rdma")]
+    fn should_use_rdma(&self, context: &ReadContext) -> bool {
+        // Check if RDMA is enabled
+        if self.rdma_manager.is_none() {
+            return false;
+        }
+
+        // Check size threshold
+        if context.len < self.rdma_inline_threshold as i64 {
+            return false;
+        }
+
+        // Check if client provided RDMA target
+        context.rdma_target.is_some()
+    }
+
+    #[cfg(not(feature = "rdma"))]
+    fn should_use_rdma(&self, _context: &ReadContext) -> bool {
+        false
+    }
+
+    /// Perform RDMA transfer to client buffer
+    #[cfg(feature = "rdma")]
+    async fn perform_rdma_transfer(
+        &self,
+        msg: &Message,
+        context: &ReadContext,
+        meta: &crate::worker::block::BlockMeta,
+    ) -> FsResult<Message> {
+        let rdma_manager = self.rdma_manager.as_ref().unwrap();
+        let memory_pool = rdma_manager.memory_pool();
+
+        // 1. Allocate RDMA staging buffer
+        let mut staging_buffer = memory_pool.allocate(context.len as usize)
+            .map_err(|e| {
+                warn!("Failed to allocate RDMA buffer: {}, falling back to TCP", e);
+                self.metrics.rdma_fallback_to_tcp.inc();
+                FsError::from(e.to_string())
+            })?;
+
+        // 2. Read block data into RDMA buffer
+        let mut file = meta.create_reader(context.off as u64)?;
+        let buffer = staging_buffer.as_mut_slice();
+
+        // Read using read_region (which returns DataSlice)
+        let data_slice = file.read_region(false, context.len as i32)?;
+
+        // Copy data from DataSlice into our RDMA buffer
+        let bytes_read = match &data_slice {
+            orpc::sys::DataSlice::Buffer(bytes) => {
+                if bytes.len() != context.len as usize {
+                    return err_box!("Incomplete read: expected {}, got {}", context.len, bytes.len());
+                }
+                buffer[..bytes.len()].copy_from_slice(bytes);
+                bytes.len()
+            }
+            orpc::sys::DataSlice::IOSlice(_) => {
+                // For IO-based DataSlice, we need to read directly
+                // This shouldn't happen with enable_send_file=false
+                return err_box!("Unexpected IOSlice in RDMA path");
+            }
+            orpc::sys::DataSlice::MemSlice(mem) => {
+                // Memory slice - copy to RDMA buffer
+                let slice = mem.as_slice();
+                if slice.len() != context.len as usize {
+                    return err_box!("Incomplete read: expected {}, got {}", context.len, slice.len());
+                }
+                buffer[..slice.len()].copy_from_slice(slice);
+                slice.len()
+            }
+            orpc::sys::DataSlice::Bytes(bytes) => {
+                // Bytes variant - copy to RDMA buffer
+                if bytes.len() != context.len as usize {
+                    return err_box!("Incomplete read: expected {}, got {}", context.len, bytes.len());
+                }
+                buffer[..bytes.len()].copy_from_slice(bytes);
+                bytes.len()
+            }
+            orpc::sys::DataSlice::Empty => {
+                return err_box!("Empty DataSlice returned");
+            }
+        };
+
+        // 3. Extract client RDMA target from context
+        let client_descriptor = context.rdma_target.as_ref().unwrap();
+        let client_offset = context.rdma_target_offset;
+
+        // 4. Submit RDMA write to client
+        let src_handle = staging_buffer.handle();
+        let src_offset = staging_buffer.offset() as u64;
+        let dst_descriptor = client_descriptor.clone().into();
+
+        info!(
+            "Submitting RDMA write: block_id={}, bytes={}, src_offset={}, dst_offset={}",
+            context.block_id, bytes_read, src_offset, client_offset
+        );
+
+        // Perform RDMA write (async completion)
+        rdma_manager.submit_write_async(
+            src_handle,
+            src_offset,
+            bytes_read as u64,
+            dst_descriptor,
+            client_offset,
+        ).await.map_err(|e| {
+            warn!("RDMA write operation failed: {}", e);
+            FsError::from(e.to_string())
+        })?;
+
+        // 5. Success - RDMA transfer completed
+        info!("RDMA write completed for block {}, {} bytes", context.block_id, bytes_read);
+        self.metrics.rdma_transfers_total.inc();
+        self.metrics.rdma_bytes_written.inc_by(bytes_read as i64);
+
+        // Build success response
+        let response = BlockReadResponse {
+            id: context.block_id,
+            len: meta.len,
+            path: None,
+            storage_type: meta.storage_type().into(),
+            rdma_transfer: Some(true),
+        };
+
+        // Note: staging_buffer deallocates automatically via Drop
+        Ok(Builder::success(msg).proto_header(response).build())
+    }
+
+    pub fn open(&mut self, msg: &Message) -> FsResult<Message> {
+        let context = ReadContext::from_req(msg)?;
+        let meta = self.store.get_block(context.block_id)?;
+
+        if context.off > meta.len {
+            return err_box!(
+                "The length of the requested data exceeds the maximum length of the block file, \
+            request off {}, file len {}",
+                context.off,
+                meta.len
+            );
+        }
+
+        // Determine if we should use RDMA
+        let use_rdma = self.should_use_rdma(&context);
+
+        if use_rdma {
+            #[cfg(feature = "rdma")]
+            {
+                info!(
+                    "RDMA read request for block {}, len: {}, offset: {}",
+                    context.block_id, context.len, context.off
+                );
+                self.metrics.rdma_enabled.set(1);
+
+                // Attempt RDMA transfer (block on async operation)
+                let rdma_result = tokio::runtime::Handle::current()
+                    .block_on(self.perform_rdma_transfer(msg, &context, &meta));
+
+                match rdma_result {
+                    Ok(response) => {
+                        let _ = self.context.replace(context);
+                        return Ok(response);
+                    }
+                    Err(e) => {
+                        warn!("RDMA transfer failed: {}, falling back to TCP", e);
+                        self.metrics.rdma_fallback_to_tcp.inc();
+                        // Fall through to TCP path below
+                    }
+                }
+            }
+        }
+
+        let response = BlockReadResponse {
+            id: context.block_id,
+            len: meta.len,
+            path: None,
+            storage_type: meta.storage_type().into(),
+            rdma_transfer: Some(false), // Set to true when RDMA is implemented
+        };
+
+        let _ = self.context.replace(context);
+
+        Ok(Builder::success(msg).proto_header(response).build())
+    }
+
+    pub fn complete(&mut self, msg: &Message) -> FsResult<Message> {
+        let _context = try_option_mut!(self.context);
+        let _ = self.context.take();
+
+        info!("Read block end for req_id {}", msg.req_id());
+        Ok(msg.success())
+    }
+}
+
+impl MessageHandler for RdmaReadHandler {
+    type Error = FsError;
+
+    fn handle(&mut self, msg: &Message) -> FsResult<Message> {
+        let request_status = msg.request_status();
+
+        match request_status {
+            RequestStatus::Open => self.open(msg),
+            RequestStatus::Complete => self.complete(msg),
+            _ => err_box!("Unsupported request type for RDMA read handler"),
+        }
+    }
+}

@@ -29,8 +29,13 @@ fxhash = { workspace = true }
 prometheus = { workspace = true }
 linked-hash-map = { workspace = true }
 
+# RDMA support
+fabric-lib = { path = "../../pplx-garden/fabric-lib", optional = true, features = ["tokio"] }
+cuda-lib = { path = "../../pplx-garden/rust/cuda-lib", optional = true }
+
 [features]
 default = ["opendal-s3"]
+rdma = ["curvine-common/rdma", "fabric-lib", "cuda-lib"]
 
 opendal = ["dep:curvine-ufs", "curvine-ufs/opendal"]
 opendal-s3 = ["opendal", "curvine-ufs/opendal-s3"]

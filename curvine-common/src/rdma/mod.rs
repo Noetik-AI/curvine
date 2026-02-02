@@ -12,28 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod worker_handler;
-pub use self::worker_handler::WorkerHandler;
+//! RDMA integration module for zero-copy data transfer
 
-mod write_handler;
-pub use self::write_handler::WriteHandler;
+pub mod config;
+pub mod conversions;
+pub mod memory_pool;
+pub mod types;
 
-mod batch_write_handler;
-pub use self::batch_write_handler::BatchWriteHandler;
-
-mod read_handler;
-pub use self::read_handler::ReadHandler;
-
-pub mod context;
-pub use self::context::*;
-
-mod block_handler;
-pub use self::block_handler::BlockHandler;
-
-mod router_handler;
-pub use self::router_handler::WorkerRouterHandler;
-
-#[cfg(feature = "rdma")]
-mod rdma_read_handler;
-#[cfg(feature = "rdma")]
-pub use self::rdma_read_handler::RdmaReadHandler;
+pub use config::*;
+pub use memory_pool::*;
+pub use types::*;

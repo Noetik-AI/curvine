@@ -8,6 +8,12 @@ edition = "2021"
 # This is used by `#[cfg(feature = "oss-hdfs")]` in integration tests.
 oss-hdfs = ["curvine-ufs/oss-hdfs"]
 
+# Enable RDMA tests
+rdma = ["curvine-common/rdma", "curvine-server/rdma", "curvine-client/rdma"]
+
+# Enable benchmark tests (requires RDMA hardware)
+bench = []
+
 [dependencies]
 orpc = { workspace = true }
 curvine-common = { workspace = true }
@@ -24,3 +30,4 @@ once_cell = { workspace = true }
 clap = { workspace = true }
 awaitility = "0.4"
 tempfile = { workspace = true }
+serde_json = { workspace = true }

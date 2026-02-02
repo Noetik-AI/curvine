@@ -23,7 +23,7 @@ ttl_retry_interval = "5s"          # Interval between retry attempts
 # masta ha raft configuration.
 [journal]
 journal_addrs = [
-    {id = 1, hostname = "localhost", port = 8996}
+    {id = 1, hostname = "0.0.0.0", port = 8996}
 ]
 journal_dir = "testing/journal"
 
@@ -37,9 +37,26 @@ data_dir = [
 log = { level = "info", log_dir = "stdout", file_name = "worker.log" }
 enable_s3_gateway = false
 
+# RDMA configuration for worker
+[worker.rdma]
+enable_rdma = false                 # Disabled by default for compatibility
+rdma_num_domains = 1                # Number of RDMA domains (typically 1 per NIC)
+rdma_pin_worker_cpu = 0             # CPU core to pin worker thread
+rdma_pin_uvm_cpu = 1                # CPU core to pin UVM thread
+rdma_memory_pool_mb = 1024          # RDMA memory pool size in MB
+rdma_inline_threshold = 65536       # Use RDMA for transfers > 64KB
+
 
 # Customer service configuration.
 [client]
+
+# RDMA configuration for client
+[client.rdma]
+enable_rdma = false                 # Disabled by default
+rdma_num_domains = 1                # Number of RDMA domains
+rdma_memory_pool_mb = 64            # RDMA memory pool size in MB
+rdma_pin_worker_cpu = 0             # CPU core to pin worker thread
+rdma_pin_uvm_cpu = 1                # CPU core to pin UVM thread
 
 # fuse configuration
 [fuse]

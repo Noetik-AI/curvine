@@ -24,6 +24,9 @@ pub mod state;
 pub mod utils;
 pub mod version;
 
+#[cfg(feature = "rdma")]
+pub mod rdma;
+
 pub mod proto {
     include!(concat!(env!("OUT_DIR"), "/protos/proto.rs"));
 

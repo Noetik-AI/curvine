@@ -1,4 +1,4 @@
-.PHONY: help check-env format format-csi build cargo docker-build docker-build-compile docker-compile docker-build-fluid-cache docker-build-fluid-thin docker-build-fluid all dist dist-only
+.PHONY: help check-env format format-csi build build-rdma cargo docker-build docker-build-compile docker-compile docker-build-fluid-cache docker-build-fluid-thin docker-build-fluid all dist dist-rdma dist-only
 
 # Default target when running 'make' without arguments
 .DEFAULT_GOAL := help
@@ -24,7 +24,9 @@ help:
 	@echo "Building:"
 	@echo "  make build ARGS='<args>'         - Build with specific arguments passed to build.sh"
 	@echo "  make all                         - Same as 'make build'"
+	@echo "  make build-rdma [ARGS='<args>']  - Build with RDMA support (requires RDMA hardware/libs)"
 	@echo "  make dist                        - Build and create distribution package (tar.gz)"
+	@echo "  make dist-rdma                   - Build with RDMA and create distribution package"
 	@echo "  make dist-only                   - Create distribution package without building"
 	@echo "  make format                      - Format Rust code using pre-commit hooks"
 	@echo "  make format-csi                  - Format curvine-csi Go code"
@@ -55,6 +57,9 @@ help:
 	@echo "  make build ARGS='-p object'                  - Build S3 object gateway"
 	@echo "  make build ARGS='--package core --ufs s3'   - Build core packages with S3 native SDK"
 	@echo "  make build ARGS='--skip-java-sdk'               - Build all packages except Java SDK"
+	@echo "  make build-rdma                             - Build with RDMA support enabled"
+	@echo "  make build-rdma ARGS='-p core'              - Build core packages with RDMA support"
+	@echo "  make build-rdma ARGS='-d'                   - Build with RDMA in debug mode"
 	@echo "  make build-hdfs                             - Build with HDFS support (native + WebHDFS)"
 	@echo "  make build-webhdfs                          - Build with WebHDFS support only"
 	@echo "  make dist                                   - Build and create distribution package"
@@ -183,8 +188,13 @@ curvine-csi-quick-push: curvine-csi-quick
 	docker push curvineio/curvine-csi:latest
 	@echo "✓ Quick-built image pushed successfully: curvineio/curvine-csi:latest"
 
-# 7. HDFS-specific builds
-.PHONY: build-hdfs build-webhdfs setup-hdfs
+# 7. Feature-specific builds
+.PHONY: build-rdma build-hdfs build-webhdfs setup-hdfs
+
+# Build with RDMA support
+build-rdma: check-env
+	@echo "Building Curvine with RDMA support..."
+	$(SHELL_CMD) build/build.sh --features rdma $(ARGS)
 
 # Build with HDFS support (native HDFS + WebHDFS)
 build-hdfs: check-env
@@ -196,6 +206,10 @@ all: build
 
 # 9. Distribution packaging
 dist: all
+	@$(MAKE) dist-only
+
+# Distribution package with RDMA support
+dist-rdma: build-rdma
 	@$(MAKE) dist-only
 
 dist-only:

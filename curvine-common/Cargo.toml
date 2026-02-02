@@ -44,9 +44,14 @@ trait-variant = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 bitflags = { workspace = true }
+bytes = { workspace = true }
+
+# RDMA support
+fabric-lib = { path = "../../pplx-garden/fabric-lib", optional = true }
 
 [features]
 default = []
+rdma = ["fabric-lib"]
 
 [build-dependencies]
 prost-build = { workspace = true }

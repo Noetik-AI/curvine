@@ -44,6 +44,8 @@ pub struct WorkerService {
     task_manager: Arc<TaskManager>,
     rt: Arc<Runtime>,
     replication_manager: Arc<WorkerReplicationManager>,
+    #[cfg(feature = "rdma")]
+    rdma_manager: Option<Arc<crate::worker::rdma::TransferEngineManager>>,
 }
 
 impl WorkerService {
@@ -55,12 +57,35 @@ impl WorkerService {
         let replication_manager =
             WorkerReplicationManager::new(&store, &rt, conf, &task_manager.get_fs_context());
 
+        #[cfg(feature = "rdma")]
+        let rdma_manager = if conf.worker.rdma.enable_rdma {
+            match crate::worker::rdma::TransferEngineManager::new(
+                conf.worker.rdma.rdma_num_domains,
+                conf.worker.rdma.rdma_pin_worker_cpu,
+                conf.worker.rdma.rdma_pin_uvm_cpu,
+                conf.worker.rdma.rdma_memory_pool_mb,
+            ) {
+                Ok(manager) => {
+                    info!("RDMA enabled for worker");
+                    Some(Arc::new(manager))
+                }
+                Err(e) => {
+                    log::warn!("Failed to initialize RDMA (fallback to TCP): {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let ws = Self {
             store,
             conf: conf.clone(),
             task_manager: Arc::new(task_manager),
             rt,
             replication_manager,
+            #[cfg(feature = "rdma")]
+            rdma_manager,
         };
         Ok(ws)
     }
@@ -130,12 +155,17 @@ impl Worker {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| NetUtils::local_ip(&net_addr.hostname));
 
+        #[cfg(feature = "rdma")]
+        let rdma_capability = service.rdma_manager.as_ref().map(|m| m.get_capability());
+
         let addr = WorkerAddress {
             worker_id,
             hostname: ip_addr.clone(),
             ip_addr,
             rpc_port: net_addr.port as u32,
             web_port: conf.worker.web_port as u32,
+            #[cfg(feature = "rdma")]
+            rdma_capability,
         };
 
         println!("worker addr: {:#?}", addr);

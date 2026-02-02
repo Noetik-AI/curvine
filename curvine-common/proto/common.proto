@@ -70,6 +70,30 @@ message FileStatusProto {
     required uint32 nlink = 19;
 }
 
+// RDMA domain address
+message RdmaDomainAddressProto {
+    required bytes address = 1;
+}
+
+// RDMA capability information
+message RdmaCapabilityProto {
+    required bool enabled = 1 [default = false];
+    repeated RdmaDomainAddressProto domain_addresses = 2;
+    required uint32 num_domains = 3 [default = 0];
+}
+
+// RDMA address/rkey pair
+message RdmaAddressRkeyPairProto {
+    optional RdmaDomainAddressProto domain_address = 1;
+    required uint64 rkey = 2;
+}
+
+// RDMA memory region descriptor
+message RdmaMemoryRegionDescriptorProto {
+    required uint64 ptr = 1;
+    repeated RdmaAddressRkeyPairProto addr_rkey_list = 2;
+}
+
 // Describe the worker address information.
 message WorkerAddressProto {
     required uint32 worker_id = 1;
@@ -77,6 +101,7 @@ message WorkerAddressProto {
     required string ip_addr = 3;
     required uint32 rpc_port = 4;
     required uint32 web_port = 5 [default = 0];
+    optional RdmaCapabilityProto rdma_capability = 6;
 }
 
 message BlockInfoProto {

@@ -18,6 +18,9 @@ use curvine_common::utils::ProtoUtils;
 use curvine_common::FsResult;
 use orpc::message::Message;
 
+#[cfg(feature = "rdma")]
+use curvine_common::rdma::MemoryRegionDescriptor;
+
 #[derive(Debug)]
 pub struct WriteContext {
     pub block: ExtendedBlock,
@@ -55,6 +58,10 @@ pub struct ReadContext {
     pub enable_read_ahead: bool,
     pub read_ahead_len: i64,
     pub drop_cache_len: i64,
+    #[cfg(feature = "rdma")]
+    pub rdma_target: Option<MemoryRegionDescriptor>,
+    #[cfg(feature = "rdma")]
+    pub rdma_target_offset: u64,
 }
 
 impl ReadContext {
@@ -70,6 +77,10 @@ impl ReadContext {
             enable_read_ahead: req.enable_read_ahead,
             read_ahead_len: req.read_ahead_len,
             drop_cache_len: req.drop_cache_len,
+            #[cfg(feature = "rdma")]
+            rdma_target: req.rdma_target.map(Into::into),
+            #[cfg(feature = "rdma")]
+            rdma_target_offset: req.rdma_target_offset.unwrap_or(0),
         };
 
         Ok(context)

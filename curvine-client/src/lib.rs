@@ -23,6 +23,9 @@ pub mod unified;
 mod client_metrics;
 pub use self::client_metrics::ClientMetrics;
 
+#[cfg(feature = "rdma")]
+pub mod rdma;
+
 pub const FILE_MIN_ALIGN_SIZE: usize = 4 * 1024;
 
 #[derive(Debug)]

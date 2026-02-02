@@ -232,6 +232,8 @@ impl BlockClient {
             enable_read_ahead: conf.enable_read_ahead,
             read_ahead_len: conf.read_ahead_len,
             drop_cache_len: conf.drop_cache_len,
+            rdma_target: None,
+            rdma_target_offset: Some(0),
         };
 
         let msg = Builder::new()
@@ -246,6 +248,26 @@ impl BlockClient {
         let rep_header: BlockReadResponse = rep.parse_header()?;
 
         Ok(BlockReadContext::from_req(rep_header))
+    }
+
+    /// Open block with a custom BlockReadRequest (for RDMA)
+    pub async fn open_block_with_request(
+        &self,
+        req_id: i64,
+        seq_id: i32,
+        request: BlockReadRequest,
+    ) -> FsResult<BlockReadResponse> {
+        let msg = Builder::new()
+            .code(RpcCode::ReadBlock)
+            .request(RequestStatus::Open)
+            .proto_header(request)
+            .req_id(req_id)
+            .seq_id(seq_id)
+            .build();
+
+        let rep = self.rpc(msg).await?;
+        let response: BlockReadResponse = rep.parse_header()?;
+        Ok(response)
     }
 
     pub async fn read_commit(

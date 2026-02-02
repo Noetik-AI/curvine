@@ -50,3 +50,8 @@ pub use self::batch_block_writer_local::BatchBlockWriterLocal;
 
 mod block_client_pool;
 pub use self::block_client_pool::BlockClientPool;
+
+#[cfg(feature = "rdma")]
+mod block_reader_rdma;
+#[cfg(feature = "rdma")]
+pub use self::block_reader_rdma::BlockReaderRdma;
