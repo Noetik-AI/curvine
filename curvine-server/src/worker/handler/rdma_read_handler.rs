@@ -209,6 +209,10 @@ impl RdmaReadHandler {
         self.metrics.rdma_transfers_total.inc();
         self.metrics.rdma_bytes_written.inc_by(bytes_read as i64);
 
+        // Explicitly drop staging buffer immediately to free pool memory
+        drop(staging_buffer);
+        info!("Released RDMA staging buffer ({} bytes) back to pool", bytes_read);
+
         // Build success response
         let response = BlockReadResponse {
             id: context.block_id,
@@ -218,7 +222,6 @@ impl RdmaReadHandler {
             rdma_transfer: Some(true),
         };
 
-        // Note: staging_buffer deallocates automatically via Drop
         Ok(Builder::success(msg).proto_header(response).build())
     }
 
