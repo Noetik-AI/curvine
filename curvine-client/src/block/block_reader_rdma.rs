@@ -35,6 +35,9 @@ pub struct BlockReaderRdma {
     rdma_manager: Arc<ClientRdmaManager>,
     #[cfg(feature = "rdma")]
     buffer: Option<RdmaBuffer>,
+    #[cfg(feature = "rdma")]
+    /// Cached data copied from RDMA buffer after transfer (buffer released after copy)
+    cached_data: Option<BytesMut>,
     client: BlockClient,
     block: ExtendedBlock,
     worker_address: WorkerAddress,
@@ -110,6 +113,7 @@ impl BlockReaderRdma {
         let reader = Self {
             rdma_manager,
             buffer,
+            cached_data: None,
             client,
             block,
             worker_address,
@@ -169,28 +173,30 @@ impl BlockReaderRdma {
             return err_box!("No readable data");
         }
 
-        if self.rdma_enabled && self.buffer.is_some() {
-            // RDMA path: data has already been transferred to our buffer
-            // The worker performs an async RDMA write that completes before responding
-            let buffer = self.buffer.as_ref().unwrap();
+        if self.rdma_enabled {
+            // RDMA path: Copy data from RDMA buffer to cache and release buffer
+            if self.buffer.is_some() && self.cached_data.is_none() {
+                // First read: copy all data from RDMA buffer to cache
+                let buffer = self.buffer.take().unwrap();  // Take ownership to avoid borrow issues
+                let data_len = buffer.size();
+                self.cached_data = Some(BytesMut::from(buffer.as_slice()));
 
-            // Calculate how much data to return in this chunk
-            let remaining = self.remaining() as usize;
-            let buffer_size = buffer.size();
-            let chunk_size = std::cmp::min(remaining, buffer_size);
+                // Buffer is automatically dropped here, releasing RDMA pool memory
+                drop(buffer);
+                info!("Copied {} bytes from RDMA buffer to cache and released buffer", data_len);
+            }
 
-            // Access the data from RDMA buffer
-            let data = &buffer.as_slice()[..chunk_size];
+            // Read from cached data
+            if let Some(cached) = &self.cached_data {
+                let start = self.pos as usize;
+                let remaining = self.remaining() as usize;
+                let chunk_size = std::cmp::min(remaining, cached.len() - start);
 
-            // Copy to DataSlice for return (using BytesMut)
-            let chunk = DataSlice::buffer(BytesMut::from(data));
+                let chunk = DataSlice::buffer(BytesMut::from(&cached[start..start + chunk_size]));
+                self.pos += chunk.len() as i64;
 
-            // Update position
-            self.pos += chunk.len() as i64;
-
-            info!("RDMA read completed: {} bytes from buffer", chunk.len());
-
-            return Ok(chunk);
+                return Ok(chunk);
+            }
         }
 
         // TCP fallback path
