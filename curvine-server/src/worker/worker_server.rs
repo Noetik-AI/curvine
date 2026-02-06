@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::worker::block::{BlockActor, BlockStore};
-use crate::worker::handler::{WorkerHandler, WorkerRouterHandler};
+use crate::worker::handler::{HandlerPool, WorkerHandler, WorkerRouterHandler};
 use crate::worker::replication::worker_replication_handler::WorkerReplicationHandler;
 use crate::worker::replication::worker_replication_manager::WorkerReplicationManager;
 use crate::worker::task::TaskManager;
@@ -44,6 +44,7 @@ pub struct WorkerService {
     task_manager: Arc<TaskManager>,
     rt: Arc<Runtime>,
     replication_manager: Arc<WorkerReplicationManager>,
+    handler_pool: Arc<HandlerPool>,
     #[cfg(feature = "rdma")]
     rdma_manager: Option<Arc<crate::worker::rdma::TransferEngineManager>>,
 }
@@ -78,12 +79,27 @@ impl WorkerService {
             None
         };
 
+        // Initialize handler pool (capacity of 1000 per handler type)
+        // This pre-allocates handlers to eliminate allocation overhead
+        let handler_pool_capacity = 1000;
+        #[cfg(feature = "rdma")]
+        let handler_pool = Arc::new(
+            HandlerPool::new(handler_pool_capacity, store.clone(), rdma_manager.clone())?
+        );
+        #[cfg(not(feature = "rdma"))]
+        let handler_pool = Arc::new(
+            HandlerPool::new(handler_pool_capacity, store.clone())?
+        );
+
+        info!("Handler pool initialized with capacity {} per type", handler_pool_capacity);
+
         let ws = Self {
             store,
             conf: conf.clone(),
             task_manager: Arc::new(task_manager),
             rt,
             replication_manager,
+            handler_pool,
             #[cfg(feature = "rdma")]
             rdma_manager,
         };
@@ -106,6 +122,7 @@ impl HandlerService for WorkerService {
         WorkerHandler {
             store: self.store.clone(),
             handler: None,
+            handler_pool: self.handler_pool.clone(),
             task_manager: self.task_manager.clone(),
             rt: self.rt.clone(),
             replication_handler: WorkerReplicationHandler::new(&self.replication_manager),

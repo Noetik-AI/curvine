@@ -1135,6 +1135,7 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
+ "crossbeam",
  "cuda-lib",
  "curvine-client",
  "curvine-common",

@@ -37,3 +37,6 @@ pub use self::router_handler::WorkerRouterHandler;
 mod rdma_read_handler;
 #[cfg(feature = "rdma")]
 pub use self::rdma_read_handler::RdmaReadHandler;
+
+mod handler_pool;
+pub use self::handler_pool::{HandlerPool, HandlerPoolStats};

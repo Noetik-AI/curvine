@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::worker::block::BlockStore;
-use crate::worker::handler::BlockHandler;
+use crate::worker::handler::{BlockHandler, HandlerPool};
 use crate::worker::replication::worker_replication_handler::WorkerReplicationHandler;
 use crate::worker::task::TaskManager;
 #[cfg(feature = "rdma")]
@@ -33,6 +33,7 @@ use std::sync::Arc;
 pub struct WorkerHandler {
     pub store: BlockStore,
     pub handler: Option<BlockHandler>,
+    pub handler_pool: Arc<HandlerPool>,
     pub task_manager: Arc<TaskManager>,
     pub rt: Arc<Runtime>,
     pub replication_handler: WorkerReplicationHandler,
@@ -56,11 +57,19 @@ impl MessageHandler for WorkerHandler {
                 let h = self.get_handler(msg)?;
                 let res = h.handle(msg);
 
+                // Release handler back to pool when request completes
                 if matches!(
                     msg.request_status(),
                     RequestStatus::Cancel | RequestStatus::Complete
                 ) {
-                    let _ = self.handler.take();
+                    if let Some(handler) = self.handler.take() {
+                        log::debug!(
+                            "Releasing handler back to pool for req_id: {}, status: {:?}",
+                            msg.req_id(),
+                            msg.request_status()
+                        );
+                        self.handler_pool.release(handler);
+                    }
                 };
 
                 res
@@ -83,18 +92,23 @@ impl WorkerHandler {
             || !Self::handler_matches_code(&self.handler, code);
 
         if need_new_handler {
-            log::info!(
-                "Creating new handler for req_id: {}, status: {:?}, code: {:?}",
+            log::debug!(
+                "Acquiring handler from pool for req_id: {}, status: {:?}, code: {:?}",
                 msg.req_id(),
                 status,
                 code
             );
-            let handler = BlockHandler::new(
-                code,
-                self.store.clone(),
-                #[cfg(feature = "rdma")]
-                self.rdma_manager.clone(),
-            )?;
+
+            // Try to acquire from pool first
+            let handler = if let Some(pooled) = self.handler_pool.acquire(code) {
+                log::debug!("Acquired handler from pool for {:?}", code);
+                pooled
+            } else {
+                // Pool exhausted, create on-demand
+                log::warn!("Handler pool exhausted, creating on-demand for {:?}", code);
+                self.handler_pool.create_handler(code)?
+            };
+
             let _ = self.handler.replace(handler);
         } else {
             log::debug!(
