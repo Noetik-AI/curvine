@@ -54,7 +54,7 @@ rdma_inline_threshold = 65536       # Use RDMA for transfers > 64KB
 [client.rdma]
 enable_rdma = true                  # Enabled for high-performance transfers
 rdma_num_domains = 1                # Number of RDMA domains
-rdma_memory_pool_mb = 64            # RDMA memory pool size in MB
+rdma_memory_pool_mb = 512           # RDMA memory pool size in MB (must be >= max block size)
 rdma_pin_worker_cpu = 0             # CPU core to pin worker thread
 rdma_pin_uvm_cpu = 1                # CPU core to pin UVM thread
 

@@ -244,20 +244,37 @@ impl RdmaMemoryPool {
         }
 
         // No suitable free block found, bump allocate from unallocated space
-        let offset = self
-            .inner
-            .current_offset
-            .fetch_add(aligned_size, Ordering::SeqCst);
+        // Use compare-exchange loop to check size BEFORE incrementing offset
+        let offset = loop {
+            let current_offset = self.inner.current_offset.load(Ordering::SeqCst);
 
-        if offset + aligned_size > self.inner.total_size {
-            // Pool exhausted - no more space to allocate
-            return Err(anyhow!(
-                "RDMA memory pool exhausted (total: {}, requested: {}, current_offset: {})",
-                self.inner.total_size,
-                aligned_size,
-                offset
-            ));
-        }
+            // Check if we have space BEFORE attempting to increment
+            if current_offset + aligned_size > self.inner.total_size {
+                return Err(anyhow!(
+                    "RDMA memory pool exhausted (total: {}, requested: {}, current_offset: {})",
+                    self.inner.total_size,
+                    aligned_size,
+                    current_offset
+                ));
+            }
+
+            // Try to atomically claim this space
+            match self.inner.current_offset.compare_exchange(
+                current_offset,
+                current_offset + aligned_size,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => {
+                    // Successfully claimed this offset
+                    break current_offset;
+                }
+                Err(_) => {
+                    // Someone else modified offset concurrently, retry
+                    continue;
+                }
+            }
+        };
 
         self.inner.alloc_count.fetch_add(1, Ordering::Relaxed);
 
