@@ -62,7 +62,7 @@ impl BlockReaderRdma {
         let seq_id = 0;
 
         // Allocate RDMA receive buffer
-        let buffer: Option<RdmaBuffer> = match RdmaBuffer::allocate(rdma_manager.memory_pool(), len as usize) {
+        let mut buffer: Option<RdmaBuffer> = match RdmaBuffer::allocate(rdma_manager.memory_pool(), len as usize) {
             Ok(buf) => {
                 info!(
                     "Allocated RDMA buffer for block {}, size: {}",
@@ -106,14 +106,28 @@ impl BlockReaderRdma {
         let response = client.open_block_with_request(req_id, seq_id, request).await?;
         let rdma_enabled = response.rdma_transfer.unwrap_or(false);
 
-        if rdma_enabled {
-            info!("RDMA transfer enabled for block {}", block.id);
-        }
+        // If RDMA transfer completed, immediately copy data and release buffer
+        let cached_data = if rdma_enabled && buffer.is_some() {
+            info!("RDMA transfer completed for block {}", block.id);
+            let buf = buffer.take().unwrap();
+            let data_len = buf.size();
+            let cached = BytesMut::from(buf.as_slice());
+
+            // Buffer is dropped here, immediately returning memory to pool
+            drop(buf);
+            info!("Copied {} bytes from RDMA buffer and released it immediately", data_len);
+            Some(cached)
+        } else {
+            if rdma_enabled {
+                warn!("RDMA enabled but no buffer allocated, using TCP fallback");
+            }
+            None
+        };
 
         let reader = Self {
             rdma_manager,
-            buffer,
-            cached_data: None,
+            buffer,  // Will be None if RDMA was used
+            cached_data,
             client,
             block,
             worker_address,
@@ -173,20 +187,8 @@ impl BlockReaderRdma {
             return err_box!("No readable data");
         }
 
+        // RDMA path: Read from cached data (buffer already released in new())
         if self.rdma_enabled {
-            // RDMA path: Copy data from RDMA buffer to cache and release buffer
-            if self.buffer.is_some() && self.cached_data.is_none() {
-                // First read: copy all data from RDMA buffer to cache
-                let buffer = self.buffer.take().unwrap();  // Take ownership to avoid borrow issues
-                let data_len = buffer.size();
-                self.cached_data = Some(BytesMut::from(buffer.as_slice()));
-
-                // Buffer is automatically dropped here, releasing RDMA pool memory
-                drop(buffer);
-                info!("Copied {} bytes from RDMA buffer to cache and released buffer", data_len);
-            }
-
-            // Read from cached data
             if let Some(cached) = &self.cached_data {
                 let start = self.pos as usize;
                 let remaining = self.remaining() as usize;
