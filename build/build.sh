@@ -442,6 +442,13 @@ if [ ${#EXTRA_FEATURES[@]} -gt 0 ]; then
         FEATURES+=("curvine-ufs/jni")
         FEATURES+=("curvine-server/jni")
         ;;
+      rdma)
+        # RDMA features need to be added to all relevant packages
+        FEATURES+=("curvine-common/rdma")
+        FEATURES+=("curvine-server/rdma")
+        FEATURES+=("curvine-client/rdma")
+        FEATURES+=("curvine-tests/rdma")
+        ;;
       *)
         # For other features, add as-is (might be package-specific)
         FEATURES+=("$feature")
