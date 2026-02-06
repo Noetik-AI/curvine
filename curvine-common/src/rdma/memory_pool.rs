@@ -68,6 +68,13 @@ impl Drop for RdmaAllocation {
     }
 }
 
+// RdmaAllocation is Send/Sync because:
+// 1. The raw pointer is managed by Arc<RdmaMemoryPoolInner> which is Send/Sync
+// 2. The memory is RDMA-registered and stable (won't be freed until Arc drops)
+// 3. The pointer is valid across threads as long as the pool is alive
+unsafe impl Send for RdmaAllocation {}
+unsafe impl Sync for RdmaAllocation {}
+
 /// Inner state of RDMA memory pool
 struct RdmaMemoryPoolInner {
     /// Base pointer of pool

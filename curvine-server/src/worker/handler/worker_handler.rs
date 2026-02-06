@@ -95,16 +95,31 @@ impl WorkerHandler {
 
     // Check if the current handler type matches the request code
     fn handler_matches_code(handler: &Option<BlockHandler>, code: RpcCode) -> bool {
-        matches!(
-            (handler, code),
-            (Some(BlockHandler::Writer(_)), RpcCode::WriteBlock)
-                | (Some(BlockHandler::Reader(_)), RpcCode::ReadBlock)
-                | (Some(BlockHandler::RdmaReader(_)), RpcCode::ReadBlock)
-                | (
-                    Some(BlockHandler::BatchWriter(_)),
-                    RpcCode::WriteBlocksBatch
-                )
-        )
+        #[cfg(feature = "rdma")]
+        {
+            matches!(
+                (handler, code),
+                (Some(BlockHandler::Writer(_)), RpcCode::WriteBlock)
+                    | (Some(BlockHandler::Reader(_)), RpcCode::ReadBlock)
+                    | (Some(BlockHandler::RdmaReader(_)), RpcCode::ReadBlock)
+                    | (
+                        Some(BlockHandler::BatchWriter(_)),
+                        RpcCode::WriteBlocksBatch
+                    )
+            )
+        }
+        #[cfg(not(feature = "rdma"))]
+        {
+            matches!(
+                (handler, code),
+                (Some(BlockHandler::Writer(_)), RpcCode::WriteBlock)
+                    | (Some(BlockHandler::Reader(_)), RpcCode::ReadBlock)
+                    | (
+                        Some(BlockHandler::BatchWriter(_)),
+                        RpcCode::WriteBlocksBatch
+                    )
+            )
+        }
     }
 
     pub fn task_submit(&self, msg: &Message) -> FsResult<Message> {

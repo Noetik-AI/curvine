@@ -24,6 +24,7 @@ use curvine_common::proto::BlockReadResponse;
 use curvine_common::FsResult;
 use log::{info, warn};
 use orpc::handler::MessageHandler;
+use orpc::io::LocalFile;
 use orpc::message::{Builder, Message, RequestStatus};
 use orpc::{err_box, try_option_mut};
 use std::sync::Arc;
@@ -34,8 +35,10 @@ pub struct RdmaReadHandler {
     #[cfg(feature = "rdma")]
     pub(crate) rdma_manager: Option<Arc<TransferEngineManager>>,
     pub(crate) context: Option<ReadContext>,
+    pub(crate) file: Option<LocalFile>,
     pub(crate) metrics: &'static WorkerMetrics,
     pub(crate) rdma_inline_threshold: usize,
+    pub(crate) enable_send_file: bool,
 }
 
 impl RdmaReadHandler {
@@ -43,23 +46,37 @@ impl RdmaReadHandler {
     pub fn new(store: BlockStore, rdma_manager: Option<Arc<TransferEngineManager>>) -> Self {
         let metrics = Worker::get_metrics();
         let conf = Worker::get_conf();
+        
+        if rdma_manager.is_some() {
+            info!("RdmaReadHandler created WITH RDMA manager, threshold={}", 
+                  conf.worker.rdma.rdma_inline_threshold);
+        } else {
+            info!("RdmaReadHandler created WITHOUT RDMA manager (will use TCP only)");
+        }
+        
         Self {
             store,
             rdma_manager,
             context: None,
+            file: None,
             metrics,
             rdma_inline_threshold: conf.worker.rdma.rdma_inline_threshold,
+            enable_send_file: conf.worker.enable_send_file,
         }
     }
 
     #[cfg(not(feature = "rdma"))]
     pub fn new(store: BlockStore) -> Self {
         let metrics = Worker::get_metrics();
+        let conf = Worker::get_conf();
+        info!("RdmaReadHandler created (RDMA feature not compiled)");
         Self {
             store,
             context: None,
+            file: None,
             metrics,
             rdma_inline_threshold: 65536,
+            enable_send_file: conf.worker.enable_send_file,
         }
     }
 
@@ -68,16 +85,30 @@ impl RdmaReadHandler {
     fn should_use_rdma(&self, context: &ReadContext) -> bool {
         // Check if RDMA is enabled
         if self.rdma_manager.is_none() {
+            info!("RDMA disabled: manager not initialized");
             return false;
         }
 
         // Check size threshold
         if context.len < self.rdma_inline_threshold as i64 {
+            info!(
+                "RDMA disabled: size {} < threshold {}",
+                context.len, self.rdma_inline_threshold
+            );
             return false;
         }
 
         // Check if client provided RDMA target
-        context.rdma_target.is_some()
+        let has_target = context.rdma_target.is_some();
+        if !has_target {
+            info!("RDMA disabled: client did not provide RDMA target descriptor");
+        } else {
+            info!(
+                "RDMA enabled: manager=yes, size={} >= threshold={}, client_target=yes",
+                context.len, self.rdma_inline_threshold
+            );
+        }
+        has_target
     }
 
     #[cfg(not(feature = "rdma"))]
@@ -235,22 +266,40 @@ impl RdmaReadHandler {
             }
         }
 
+        // TCP fallback path: prepare file for streaming
+        let file = meta.create_reader(context.off as u64)?;
+        
         let response = BlockReadResponse {
             id: context.block_id,
             len: meta.len,
             path: None,
             storage_type: meta.storage_type().into(),
-            rdma_transfer: Some(false), // Set to true when RDMA is implemented
+            rdma_transfer: Some(false),
         };
 
+        let _ = self.file.replace(file);
         let _ = self.context.replace(context);
 
         Ok(Builder::success(msg).proto_header(response).build())
     }
 
+    pub fn read(&mut self, msg: &Message) -> FsResult<Message> {
+        let file = try_option_mut!(self.file);
+        let context = try_option_mut!(self.context);
+
+        // Read chunk from file
+        let region = file.read_region(self.enable_send_file, context.chuck_size)?;
+        
+        self.metrics.read_bytes.inc_by(region.len() as i64);
+        self.metrics.read_count.inc();
+
+        Ok(msg.success_with_data(None, region))
+    }
+
     pub fn complete(&mut self, msg: &Message) -> FsResult<Message> {
         let _context = try_option_mut!(self.context);
         let _ = self.context.take();
+        let _ = self.file.take();
 
         info!("Read block end for req_id {}", msg.req_id());
         Ok(msg.success())
@@ -265,6 +314,7 @@ impl MessageHandler for RdmaReadHandler {
 
         match request_status {
             RequestStatus::Open => self.open(msg),
+            RequestStatus::Running => self.read(msg),
             RequestStatus::Complete => self.complete(msg),
             _ => err_box!("Unsupported request type for RDMA read handler"),
         }

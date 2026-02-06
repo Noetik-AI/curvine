@@ -13,8 +13,12 @@
 // limitations under the License.
 
 use crate::worker::block::BlockStore;
-use crate::worker::handler::BlockHandler::{BatchWriter, Reader, RdmaReader, Writer};
-use crate::worker::handler::{BatchWriteHandler, ReadHandler, RdmaReadHandler, WriteHandler};
+#[cfg(feature = "rdma")]
+use crate::worker::handler::BlockHandler::RdmaReader;
+use crate::worker::handler::BlockHandler::{BatchWriter, Reader, Writer};
+use crate::worker::handler::{BatchWriteHandler, ReadHandler, WriteHandler};
+#[cfg(feature = "rdma")]
+use crate::worker::handler::RdmaReadHandler;
 #[cfg(feature = "rdma")]
 use crate::worker::rdma::TransferEngineManager;
 use curvine_common::error::FsError;
@@ -23,11 +27,13 @@ use curvine_common::FsResult;
 use orpc::handler::MessageHandler;
 use orpc::message::Message;
 use orpc::{err_box, CommonResult};
+#[cfg(feature = "rdma")]
 use std::sync::Arc;
 
 pub enum BlockHandler {
     Writer(WriteHandler),
     Reader(ReadHandler),
+    #[cfg(feature = "rdma")]
     RdmaReader(RdmaReadHandler),
     BatchWriter(BatchWriteHandler),
 }
@@ -82,6 +88,7 @@ impl MessageHandler for BlockHandler {
         let response = match self {
             Writer(h) => h.handle(msg),
             Reader(h) => h.handle(msg),
+            #[cfg(feature = "rdma")]
             RdmaReader(h) => h.handle(msg),
             BatchWriter(h) => h.handle(msg),
         };

@@ -155,6 +155,14 @@ impl BlockReaderRdma {
         self.len - self.pos
     }
 
+    pub fn seek(&mut self, pos: i64) -> FsResult<i64> {
+        if pos < 0 || pos > self.len {
+            return err_box!("Invalid seek position: {}", pos);
+        }
+        self.pos = pos;
+        Ok(self.pos)
+    }
+
     #[cfg(feature = "rdma")]
     pub async fn read(&mut self) -> FsResult<DataSlice> {
         if self.remaining() <= 0 {
