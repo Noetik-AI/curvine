@@ -93,7 +93,8 @@ impl ClientRdmaManager {
     }
 
     /// Get statistics about the memory pool
-    pub fn pool_stats(&self) -> (usize, usize, usize) {
+    /// Returns: (current_offset, alloc_count, dealloc_count, free_blocks_count, free_bytes)
+    pub fn pool_stats(&self) -> (usize, usize, usize, usize, usize) {
         self.memory_pool.stats()
     }
 

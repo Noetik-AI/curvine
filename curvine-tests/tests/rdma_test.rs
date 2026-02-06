@@ -295,7 +295,7 @@ mod rdma_memory_pool_tests {
         let pool_size = 1024 * 1024;
         let pool = RdmaMemoryPool::new_mock(pool_size);
 
-        let (allocated, alloc_count, dealloc_count) = pool.stats();
+        let (allocated, alloc_count, dealloc_count, _, _) = pool.stats();
         assert_eq!(allocated, 0);
         assert_eq!(alloc_count, 0);
         assert_eq!(dealloc_count, 0);
@@ -316,7 +316,7 @@ mod rdma_memory_pool_tests {
         assert_eq!(alloc.size(), alloc_size);
 
         // Check pool stats
-        let (allocated, alloc_count, _) = pool.stats();
+        let (allocated, alloc_count, _, _, _) = pool.stats();
         assert!(allocated >= alloc_size); // May be aligned
         assert_eq!(alloc_count, 1);
     }
@@ -348,7 +348,7 @@ mod rdma_memory_pool_tests {
             allocations.push(alloc);
         }
 
-        let (_, alloc_count, _) = pool.stats();
+        let (_, alloc_count, _, _, _) = pool.stats();
         assert_eq!(alloc_count, 4);
 
         // Next allocation should fail (pool exhausted)
@@ -365,7 +365,7 @@ mod rdma_memory_pool_tests {
 
         {
             let _alloc = pool.allocate(alloc_size).unwrap();
-            let (allocated, _, _) = pool.stats();
+            let (allocated, _, _, _, _) = pool.stats();
             assert!(allocated > 0);
         } // _alloc dropped here
 
@@ -383,14 +383,14 @@ mod rdma_memory_pool_tests {
 
         // Allocate some memory
         let _alloc = pool.allocate(100 * 1024).unwrap();
-        let (allocated_before, _, _) = pool.stats();
+        let (allocated_before, _, _, _, _) = pool.stats();
         assert!(allocated_before > 0);
 
         // Reset pool
         pool.reset();
 
         // After reset, offset should be 0
-        let (allocated_after, _, _) = pool.stats();
+        let (allocated_after, _, _, _, _) = pool.stats();
         assert_eq!(allocated_after, 0);
 
         // Should be able to allocate again
