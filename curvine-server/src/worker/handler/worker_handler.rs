@@ -72,12 +72,23 @@ impl MessageHandler for WorkerHandler {
 impl WorkerHandler {
     fn get_handler(&mut self, msg: &Message) -> FsResult<&mut BlockHandler> {
         let code = RpcCode::from(msg.code());
+        let status = msg.request_status();
 
+        // Determine if we need a new handler:
+        // 1. Always create if no handler exists
+        // 2. For Open requests: create new if type doesn't match (to start fresh)
+        // 3. For Running/Complete/Cancel: ONLY create if type doesn't match
+        //    (otherwise REUSE to preserve state like context from open())
         let need_new_handler = self.handler.is_none()
-            || !matches!(msg.request_status(), RequestStatus::Running)
             || !Self::handler_matches_code(&self.handler, code);
 
         if need_new_handler {
+            log::info!(
+                "Creating new handler for req_id: {}, status: {:?}, code: {:?}",
+                msg.req_id(),
+                status,
+                code
+            );
             let handler = BlockHandler::new(
                 code,
                 self.store.clone(),
@@ -85,6 +96,12 @@ impl WorkerHandler {
                 self.rdma_manager.clone(),
             )?;
             let _ = self.handler.replace(handler);
+        } else {
+            log::debug!(
+                "Reusing existing handler for req_id: {}, status: {:?}",
+                msg.req_id(),
+                status
+            );
         }
 
         match self.handler.as_mut() {
