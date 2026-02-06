@@ -42,80 +42,25 @@ pub struct HandlerPool {
 }
 
 impl HandlerPool {
-    /// Create a new handler pool with specified capacity per handler type
+    /// Create a new handler pool with specified capacity per handler type.
+    /// Handlers are allocated lazily on first use to avoid initialization order issues.
     pub fn new(
         capacity: usize,
         store: BlockStore,
         #[cfg(feature = "rdma")]
         rdma_manager: Option<Arc<TransferEngineManager>>,
     ) -> FsResult<Self> {
-        log::info!("Initializing handler pool with capacity {} per type", capacity);
+        log::info!(
+            "Initializing handler pool with capacity {} per type (lazy allocation)",
+            capacity
+        );
 
         let reader_pool = SegQueue::new();
         let writer_pool = SegQueue::new();
         let batch_writer_pool = SegQueue::new();
 
-        // Pre-allocate readers
-        for i in 0..capacity {
-            #[cfg(feature = "rdma")]
-            let handler = BlockHandler::new(
-                RpcCode::ReadBlock,
-                store.clone(),
-                rdma_manager.clone(),
-            )?;
-
-            #[cfg(not(feature = "rdma"))]
-            let handler = BlockHandler::new(RpcCode::ReadBlock, store.clone())?;
-
-            reader_pool.push(handler);
-
-            if i % 100 == 0 && i > 0 {
-                log::debug!("Pre-allocated {} readers", i);
-            }
-        }
-
-        // Pre-allocate writers
-        for i in 0..capacity {
-            #[cfg(feature = "rdma")]
-            let handler = BlockHandler::new(
-                RpcCode::WriteBlock,
-                store.clone(),
-                rdma_manager.clone(),
-            )?;
-
-            #[cfg(not(feature = "rdma"))]
-            let handler = BlockHandler::new(RpcCode::WriteBlock, store.clone())?;
-
-            writer_pool.push(handler);
-
-            if i % 100 == 0 && i > 0 {
-                log::debug!("Pre-allocated {} writers", i);
-            }
-        }
-
-        // Pre-allocate batch writers
-        for i in 0..capacity {
-            #[cfg(feature = "rdma")]
-            let handler = BlockHandler::new(
-                RpcCode::WriteBlocksBatch,
-                store.clone(),
-                rdma_manager.clone(),
-            )?;
-
-            #[cfg(not(feature = "rdma"))]
-            let handler = BlockHandler::new(RpcCode::WriteBlocksBatch, store.clone())?;
-
-            batch_writer_pool.push(handler);
-
-            if i % 100 == 0 && i > 0 {
-                log::debug!("Pre-allocated {} batch writers", i);
-            }
-        }
-
-        log::info!(
-            "Handler pool initialized: {} readers, {} writers, {} batch writers",
-            capacity, capacity, capacity
-        );
+        // Don't pre-allocate here - handlers will be created on-demand
+        // This avoids initialization order issues with WorkerMetrics
 
         Ok(Self {
             reader_pool,
@@ -126,6 +71,76 @@ impl HandlerPool {
             rdma_manager,
             capacity,
         })
+    }
+
+    /// Warm up the pool by pre-allocating handlers.
+    /// Call this after all dependencies (like WorkerMetrics) are initialized.
+    pub fn warm_up(&self) -> FsResult<()> {
+        log::info!("Warming up handler pool with {} handlers per type", self.capacity);
+
+        // Pre-allocate readers
+        for i in 0..self.capacity {
+            #[cfg(feature = "rdma")]
+            let handler = BlockHandler::new(
+                RpcCode::ReadBlock,
+                self.store.clone(),
+                self.rdma_manager.clone(),
+            )?;
+
+            #[cfg(not(feature = "rdma"))]
+            let handler = BlockHandler::new(RpcCode::ReadBlock, self.store.clone())?;
+
+            self.reader_pool.push(handler);
+
+            if i % 100 == 0 && i > 0 {
+                log::debug!("Pre-allocated {} readers", i);
+            }
+        }
+
+        // Pre-allocate writers
+        for i in 0..self.capacity {
+            #[cfg(feature = "rdma")]
+            let handler = BlockHandler::new(
+                RpcCode::WriteBlock,
+                self.store.clone(),
+                self.rdma_manager.clone(),
+            )?;
+
+            #[cfg(not(feature = "rdma"))]
+            let handler = BlockHandler::new(RpcCode::WriteBlock, self.store.clone())?;
+
+            self.writer_pool.push(handler);
+
+            if i % 100 == 0 && i > 0 {
+                log::debug!("Pre-allocated {} writers", i);
+            }
+        }
+
+        // Pre-allocate batch writers
+        for i in 0..self.capacity {
+            #[cfg(feature = "rdma")]
+            let handler = BlockHandler::new(
+                RpcCode::WriteBlocksBatch,
+                self.store.clone(),
+                self.rdma_manager.clone(),
+            )?;
+
+            #[cfg(not(feature = "rdma"))]
+            let handler = BlockHandler::new(RpcCode::WriteBlocksBatch, self.store.clone())?;
+
+            self.batch_writer_pool.push(handler);
+
+            if i % 100 == 0 && i > 0 {
+                log::debug!("Pre-allocated {} batch writers", i);
+            }
+        }
+
+        log::info!(
+            "Handler pool warmed up: {} readers, {} writers, {} batch writers",
+            self.capacity, self.capacity, self.capacity
+        );
+
+        Ok(())
     }
 
     /// Acquire a handler from the pool for the given RPC code.

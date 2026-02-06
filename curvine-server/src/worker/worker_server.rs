@@ -160,6 +160,11 @@ impl Worker {
 
         CLUSTER_CONF.get_or_init(|| conf.clone());
         WORKER_METRICS.get_or_init(|| WorkerMetrics::new(service.store.clone()).unwrap());
+
+        // Warm up the handler pool after metrics are initialized
+        info!("Warming up handler pool...");
+        service.handler_pool.warm_up()?;
+
         conf.print();
 
         let block_store = service.store.clone();
