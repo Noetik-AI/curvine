@@ -128,12 +128,17 @@ impl RdmaReadHandler {
         let memory_pool = rdma_manager.memory_pool();
 
         // 1. Allocate RDMA staging buffer
+        info!("perform_rdma_transfer() - attempting to allocate {} bytes from worker RDMA pool", context.len);
         let mut staging_buffer = memory_pool.allocate(context.len as usize)
             .map_err(|e| {
-                warn!("Failed to allocate RDMA buffer: {}, falling back to TCP", e);
+                log::error!(
+                    "perform_rdma_transfer() - FAILED to allocate RDMA buffer: {} (block: {}, len: {}), falling back to TCP",
+                    e, context.block_id, context.len
+                );
                 self.metrics.rdma_fallback_to_tcp.inc();
                 FsError::from(e.to_string())
             })?;
+        info!("perform_rdma_transfer() - successfully allocated staging buffer at offset {}", staging_buffer.offset());
 
         // 2. Read block data into RDMA buffer
         let mut file = meta.create_reader(context.off as u64)?;
@@ -226,7 +231,13 @@ impl RdmaReadHandler {
     }
 
     pub fn open(&mut self, msg: &Message) -> FsResult<Message> {
+        let req_id = msg.req_id();
+        info!("RDMA open() called - req_id: {}, header_len: {}", req_id, msg.header_len());
+
         let context = ReadContext::from_req(msg)?;
+        info!("RDMA open() - block_id: {}, off: {}, len: {}",
+              context.block_id, context.off, context.len);
+
         let meta = self.store.get_block(context.block_id)?;
 
         if context.off > meta.len {
@@ -240,14 +251,14 @@ impl RdmaReadHandler {
 
         // Determine if we should use RDMA
         let use_rdma = self.should_use_rdma(&context);
-        info!("use_rdma: {}", use_rdma);
+        info!("RDMA open() - use_rdma: {} for req_id: {}", use_rdma, req_id);
 
         if use_rdma {
             #[cfg(feature = "rdma")]
             {
                 info!(
-                    "RDMA read request for block {}, len: {}, offset: {}",
-                    context.block_id, context.len, context.off
+                    "RDMA open() - starting RDMA transfer for block {}, len: {}, offset: {}, req_id: {}",
+                    context.block_id, context.len, context.off, req_id
                 );
                 self.metrics.rdma_enabled.set(1);
 
@@ -258,10 +269,11 @@ impl RdmaReadHandler {
                 match rdma_result {
                     Ok(response) => {
                         let _ = self.context.replace(context);
+                        info!("RDMA open() - SUCCESS: RDMA transfer completed, context set, req_id: {}", req_id);
                         return Ok(response);
                     }
                     Err(e) => {
-                        warn!("RDMA transfer failed: {}, falling back to TCP", e);
+                        warn!("RDMA open() - RDMA transfer FAILED for req_id: {}: {}, falling back to TCP", req_id, e);
                         self.metrics.rdma_fallback_to_tcp.inc();
                         // Fall through to TCP path below
                     }
@@ -270,8 +282,9 @@ impl RdmaReadHandler {
         }
 
         // TCP fallback path: prepare file for streaming
+        info!("RDMA open() - using TCP fallback for req_id: {}, block_id: {}", req_id, context.block_id);
         let file = meta.create_reader(context.off as u64)?;
-        
+
         let response = BlockReadResponse {
             id: context.block_id,
             len: meta.len,
@@ -282,11 +295,24 @@ impl RdmaReadHandler {
 
         let _ = self.file.replace(file);
         let _ = self.context.replace(context);
+        info!("RDMA open() - TCP fallback setup complete, context set, req_id: {}", req_id);
 
         Ok(Builder::success(msg).proto_header(response).build())
     }
 
     pub fn read(&mut self, msg: &Message) -> FsResult<Message> {
+        let req_id = msg.req_id();
+        info!("RDMA read() called - req_id: {}", req_id);
+
+        if self.file.is_none() || self.context.is_none() {
+            let err_msg = format!(
+                "RDMA read() - ERROR: file or context is None for req_id: {}. file: {}, context: {}",
+                req_id, self.file.is_some(), self.context.is_some()
+            );
+            log::error!("{}", err_msg);
+            return err_box!("{}", err_msg);
+        }
+
         let file = try_option_mut!(self.file);
         let context = try_option_mut!(self.context);
 
@@ -300,11 +326,25 @@ impl RdmaReadHandler {
     }
 
     pub fn complete(&mut self, msg: &Message) -> FsResult<Message> {
+        let req_id = msg.req_id();
+        info!("RDMA complete() called - req_id: {}", req_id);
+
+        // Check if context exists before accessing
+        if self.context.is_none() {
+            let err_msg = format!(
+                "RDMA complete() - ERROR: context is None for req_id: {}. This means open() either failed or was never called successfully. file present: {}",
+                req_id,
+                self.file.is_some()
+            );
+            log::error!("{}", err_msg);
+            return err_box!("{}", err_msg);
+        }
+
         let _context = try_option_mut!(self.context);
         let _ = self.context.take();
         let _ = self.file.take();
 
-        info!("Read block end for req_id {}", msg.req_id());
+        info!("RDMA complete() - SUCCESS: cleaned up context and file for req_id: {}", req_id);
         Ok(msg.success())
     }
 }
