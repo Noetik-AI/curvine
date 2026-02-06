@@ -13,22 +13,53 @@
 // limitations under the License.
 
 use crate::worker::block::BlockStore;
-use crate::worker::handler::BlockHandler::{BatchWriter, Reader, Writer};
-use crate::worker::handler::{BatchWriteHandler, ReadHandler, WriteHandler};
+use crate::worker::handler::BlockHandler::{BatchWriter, Reader, RdmaReader, Writer};
+use crate::worker::handler::{BatchWriteHandler, ReadHandler, RdmaReadHandler, WriteHandler};
+#[cfg(feature = "rdma")]
+use crate::worker::rdma::TransferEngineManager;
 use curvine_common::error::FsError;
 use curvine_common::fs::RpcCode;
 use curvine_common::FsResult;
 use orpc::handler::MessageHandler;
 use orpc::message::Message;
 use orpc::{err_box, CommonResult};
+use std::sync::Arc;
 
 pub enum BlockHandler {
     Writer(WriteHandler),
     Reader(ReadHandler),
+    RdmaReader(RdmaReadHandler),
     BatchWriter(BatchWriteHandler),
 }
 
 impl BlockHandler {
+    #[cfg(feature = "rdma")]
+    pub fn new(
+        code: RpcCode,
+        store: BlockStore,
+        rdma_manager: Option<Arc<TransferEngineManager>>,
+    ) -> CommonResult<Self> {
+        let handler = match code {
+            RpcCode::WriteBlock => Writer(WriteHandler::new(store)),
+
+            RpcCode::ReadBlock => {
+                // Use RDMA reader if RDMA manager is available
+                if rdma_manager.is_some() {
+                    RdmaReader(RdmaReadHandler::new(store, rdma_manager))
+                } else {
+                    Reader(ReadHandler::new(store))
+                }
+            }
+
+            RpcCode::WriteBlocksBatch => BatchWriter(BatchWriteHandler::new(store)),
+
+            code => return err_box!("Unsupported request type: {:?}", code),
+        };
+
+        Ok(handler)
+    }
+
+    #[cfg(not(feature = "rdma"))]
     pub fn new(code: RpcCode, store: BlockStore) -> CommonResult<Self> {
         let handler = match code {
             RpcCode::WriteBlock => Writer(WriteHandler::new(store)),
@@ -51,6 +82,7 @@ impl MessageHandler for BlockHandler {
         let response = match self {
             Writer(h) => h.handle(msg),
             Reader(h) => h.handle(msg),
+            RdmaReader(h) => h.handle(msg),
             BatchWriter(h) => h.handle(msg),
         };
 

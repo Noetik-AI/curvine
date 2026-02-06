@@ -16,6 +16,8 @@ use crate::worker::block::BlockStore;
 use crate::worker::handler::BlockHandler;
 use crate::worker::replication::worker_replication_handler::WorkerReplicationHandler;
 use crate::worker::task::TaskManager;
+#[cfg(feature = "rdma")]
+use crate::worker::rdma::TransferEngineManager;
 use curvine_common::error::FsError;
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::*;
@@ -34,6 +36,8 @@ pub struct WorkerHandler {
     pub task_manager: Arc<TaskManager>,
     pub rt: Arc<Runtime>,
     pub replication_handler: WorkerReplicationHandler,
+    #[cfg(feature = "rdma")]
+    pub rdma_manager: Option<Arc<TransferEngineManager>>,
 }
 
 impl MessageHandler for WorkerHandler {
@@ -74,7 +78,12 @@ impl WorkerHandler {
             || !Self::handler_matches_code(&self.handler, code);
 
         if need_new_handler {
-            let handler = BlockHandler::new(code, self.store.clone())?;
+            let handler = BlockHandler::new(
+                code,
+                self.store.clone(),
+                #[cfg(feature = "rdma")]
+                self.rdma_manager.clone(),
+            )?;
             let _ = self.handler.replace(handler);
         }
 
@@ -90,6 +99,7 @@ impl WorkerHandler {
             (handler, code),
             (Some(BlockHandler::Writer(_)), RpcCode::WriteBlock)
                 | (Some(BlockHandler::Reader(_)), RpcCode::ReadBlock)
+                | (Some(BlockHandler::RdmaReader(_)), RpcCode::ReadBlock)
                 | (
                     Some(BlockHandler::BatchWriter(_)),
                     RpcCode::WriteBlocksBatch

@@ -109,6 +109,8 @@ impl HandlerService for WorkerService {
             task_manager: self.task_manager.clone(),
             rt: self.rt.clone(),
             replication_handler: WorkerReplicationHandler::new(&self.replication_manager),
+            #[cfg(feature = "rdma")]
+            rdma_manager: self.rdma_manager.clone(),
         }
     }
 }

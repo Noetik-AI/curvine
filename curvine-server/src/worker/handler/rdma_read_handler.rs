@@ -206,6 +206,7 @@ impl RdmaReadHandler {
 
         // Determine if we should use RDMA
         let use_rdma = self.should_use_rdma(&context);
+        info!("use_rdma: {}", use_rdma);
 
         if use_rdma {
             #[cfg(feature = "rdma")]
