@@ -33,6 +33,10 @@ pub struct RdmaWorkerConfig {
     pub rdma_page_cache_max_size_mb: usize,
     /// Minimum transfer size to use RDMA (bytes)
     pub rdma_inline_threshold: usize,
+    /// Use direct polling mode (single-threaded, lower latency)
+    pub rdma_direct_polling: bool,
+    /// Polling interval in microseconds (only for direct polling mode)
+    pub rdma_poll_interval_us: u64,
 }
 
 impl Default for RdmaWorkerConfig {
@@ -45,6 +49,8 @@ impl Default for RdmaWorkerConfig {
             rdma_memory_pool_mb: 1024,
             rdma_page_cache_max_size_mb: 20480, // 20GB default
             rdma_inline_threshold: 65536, // 64KB
+            rdma_direct_polling: true, // Enable by default for better performance
+            rdma_poll_interval_us: 10, // Poll every 10 microseconds
         }
     }
 }

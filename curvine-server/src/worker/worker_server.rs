@@ -60,12 +60,26 @@ impl WorkerService {
 
         #[cfg(feature = "rdma")]
         let rdma_manager = if conf.worker.rdma.enable_rdma {
-            match crate::worker::rdma::TransferEngineManager::new(
-                conf.worker.rdma.rdma_num_domains,
-                conf.worker.rdma.rdma_pin_worker_cpu,
-                conf.worker.rdma.rdma_pin_uvm_cpu,
-                conf.worker.rdma.rdma_memory_pool_mb,
-            ) {
+            // Choose direct polling or async callback mode based on configuration
+            let result = if conf.worker.rdma.rdma_direct_polling {
+                info!("Initializing RDMA in DIRECT POLLING mode");
+                crate::worker::rdma::TransferEngineManager::new_direct(
+                    conf.worker.rdma.rdma_num_domains,
+                    conf.worker.rdma.rdma_pin_worker_cpu,
+                    conf.worker.rdma.rdma_pin_uvm_cpu,
+                    conf.worker.rdma.rdma_memory_pool_mb,
+                )
+            } else {
+                info!("Initializing RDMA in ASYNC CALLBACK mode");
+                crate::worker::rdma::TransferEngineManager::new(
+                    conf.worker.rdma.rdma_num_domains,
+                    conf.worker.rdma.rdma_pin_worker_cpu,
+                    conf.worker.rdma.rdma_pin_uvm_cpu,
+                    conf.worker.rdma.rdma_memory_pool_mb,
+                )
+            };
+
+            match result {
                 Ok(manager) => {
                     info!("RDMA enabled for worker");
                     Some(Arc::new(manager))
@@ -247,6 +261,50 @@ impl Worker {
                 info!("Starting S3 gateway alongside worker");
                 let worker_rt = self.rpc_server.clone_rt();
                 Self::start_s3_gateway(conf.clone(), worker_rt).await;
+            }
+        }
+
+        // step 2.5: Start RDMA polling task if direct polling is enabled
+        #[cfg(feature = "rdma")]
+        if conf.worker.rdma.enable_rdma && conf.worker.rdma.rdma_direct_polling {
+            let service = self.rpc_server.service();
+            if let Some(ref rdma_manager) = service.rdma_manager {
+                if rdma_manager.is_direct_polling_enabled() {
+                    let rdma_mgr = rdma_manager.clone();
+                    let poll_interval_us = conf.worker.rdma.rdma_poll_interval_us;
+
+                    info!(
+                        "Starting RDMA direct polling task (interval: {}µs)",
+                        poll_interval_us
+                    );
+
+                    // Spawn dedicated RDMA polling task
+                    let rt = self.rpc_server.clone_rt();
+                    rt.spawn(async move {
+                        let mut interval = tokio::time::interval(
+                            std::time::Duration::from_micros(poll_interval_us)
+                        );
+
+                        loop {
+                            interval.tick().await;
+
+                            match rdma_mgr.poll_completions() {
+                                Ok(count) if count > 0 => {
+                                    // Completions processed
+                                }
+                                Ok(_) => {
+                                    // No completions, continue polling
+                                }
+                                Err(e) => {
+                                    log::error!("RDMA polling error: {}", e);
+                                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                                }
+                            }
+                        }
+                    });
+
+                    info!("RDMA direct polling task started successfully");
+                }
             }
         }
 

@@ -17,9 +17,10 @@
 use curvine_common::rdma::{
     DomainAddress, MemoryRegionDescriptor, RdmaCapability, RdmaMemoryPool,
 };
-use fabric_lib::{AsyncTransferEngine, RdmaEngine, TransferEngine};
+use fabric_lib::{AsyncTransferEngine, DirectPollHandle, RdmaEngine, TransferEngine};
 use fabric_lib::api::{SingleTransferRequest, DomainGroupRouting, TransferRequest, MemoryRegionHandle};
 use log::info;
+use parking_lot::Mutex;
 use std::num::NonZeroU8;
 use std::ptr::NonNull;
 use std::sync::Arc;
@@ -30,10 +31,76 @@ pub struct TransferEngineManager {
     memory_pool: RdmaMemoryPool,
     domain_addresses: Vec<DomainAddress>,
     num_domains: usize,
+
+    /// Direct poll handle (if direct polling mode is enabled)
+    poll_handle: Option<Mutex<DirectPollHandle>>,
+    direct_polling_enabled: bool,
 }
 
 impl TransferEngineManager {
-    /// Create a new TransferEngineManager for host-only RDMA
+    /// Create a new TransferEngineManager for host-only RDMA with direct polling mode
+    pub fn new_direct(
+        num_domains: usize,
+        pin_worker_cpu: usize,
+        pin_uvm_cpu: usize,
+        memory_pool_size_mb: usize,
+    ) -> Result<Self, String> {
+        info!(
+            "Initializing RDMA TransferEngine in DIRECT POLLING mode: domains={}, pool={}MB",
+            num_domains, memory_pool_size_mb
+        );
+
+        // Create TransferEngine for host memory in direct polling mode
+        let (engine, poll_handle) = TransferEngine::new_host_only_direct(
+            num_domains,
+            pin_worker_cpu as u16,
+            pin_uvm_cpu as u16,
+        )
+        .map_err(|e| format!("Failed to create TransferEngine: {}", e))?;
+
+        let engine = Arc::new(engine);
+
+        // Get domain addresses for capability advertisement
+        let domain_addresses = vec![engine.main_address().into()];
+
+        info!(
+            "TransferEngine created successfully in DIRECT POLLING mode with {} domains",
+            engine.num_domains()
+        );
+
+        // Create and register RDMA memory pool
+        let pool_size_bytes = memory_pool_size_mb * 1024 * 1024;
+        let mut buffer = vec![0u8; pool_size_bytes];
+        let buffer_ptr = NonNull::new(buffer.as_mut_ptr())
+            .ok_or_else(|| "Null buffer pointer".to_string())?;
+
+        let (handle, fabric_descriptor) = engine
+            .register_memory_allow_remote(
+                buffer_ptr.cast(),
+                pool_size_bytes,
+                ::cuda_lib::Device::Host,
+            )
+            .map_err(|e| format!("Failed to register RDMA memory: {}", e))?;
+
+        let descriptor: MemoryRegionDescriptor = fabric_descriptor.into();
+        let memory_pool = RdmaMemoryPool::new(buffer, descriptor, handle);
+
+        info!(
+            "RDMA memory pool registered: {}MB",
+            pool_size_bytes / (1024 * 1024)
+        );
+
+        Ok(TransferEngineManager {
+            engine,
+            memory_pool,
+            domain_addresses,
+            num_domains,
+            poll_handle: Some(Mutex::new(poll_handle)),
+            direct_polling_enabled: true,
+        })
+    }
+
+    /// Create a new TransferEngineManager for host-only RDMA (async callback mode)
     pub fn new(
         num_domains: usize,
         pin_worker_cpu: usize,
@@ -41,7 +108,7 @@ impl TransferEngineManager {
         memory_pool_size_mb: usize,
     ) -> Result<Self, String> {
         info!(
-            "Initializing RDMA TransferEngine: domains={}, pool={}MB",
+            "Initializing RDMA TransferEngine in ASYNC mode: domains={}, pool={}MB",
             num_domains, memory_pool_size_mb
         );
 
@@ -90,7 +157,33 @@ impl TransferEngineManager {
             memory_pool,
             domain_addresses,
             num_domains,
+            poll_handle: None,
+            direct_polling_enabled: false,
         })
+    }
+
+    /// Poll for RDMA completions (only works in direct polling mode).
+    /// Returns the number of completions processed.
+    ///
+    /// This must be called regularly from the application's event loop when
+    /// direct polling mode is enabled.
+    pub fn poll_completions(&self) -> Result<usize, String> {
+        if !self.direct_polling_enabled {
+            return Ok(0); // Not in direct polling mode
+        }
+
+        if let Some(ref handle) = self.poll_handle {
+            handle.lock()
+                .poll()
+                .map_err(|e| format!("RDMA poll failed: {}", e))
+        } else {
+            Ok(0)
+        }
+    }
+
+    /// Check if direct polling is enabled
+    pub fn is_direct_polling_enabled(&self) -> bool {
+        self.direct_polling_enabled
     }
 
     /// Get RDMA capability for advertisement to master
