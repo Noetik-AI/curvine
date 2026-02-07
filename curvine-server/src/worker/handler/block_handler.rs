@@ -20,6 +20,8 @@ use crate::worker::handler::{BatchWriteHandler, ReadHandler, WriteHandler};
 #[cfg(feature = "rdma")]
 use crate::worker::handler::RdmaReadHandler;
 #[cfg(feature = "rdma")]
+use crate::worker::handler::PageCacheTable;
+#[cfg(feature = "rdma")]
 use crate::worker::rdma::TransferEngineManager;
 use curvine_common::error::FsError;
 use curvine_common::fs::RpcCode;
@@ -44,6 +46,7 @@ impl BlockHandler {
         code: RpcCode,
         store: BlockStore,
         rdma_manager: Option<Arc<TransferEngineManager>>,
+        page_cache_table: Option<Arc<PageCacheTable>>,
     ) -> CommonResult<Self> {
         let handler = match code {
             RpcCode::WriteBlock => Writer(WriteHandler::new(store)),
@@ -51,7 +54,7 @@ impl BlockHandler {
             RpcCode::ReadBlock => {
                 // Use RDMA reader if RDMA manager is available
                 if rdma_manager.is_some() {
-                    RdmaReader(RdmaReadHandler::new(store, rdma_manager))
+                    RdmaReader(RdmaReadHandler::new(store, rdma_manager, page_cache_table))
                 } else {
                     Reader(ReadHandler::new(store))
                 }

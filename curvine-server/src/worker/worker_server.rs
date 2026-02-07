@@ -79,12 +79,24 @@ impl WorkerService {
             None
         };
 
+        // Initialize page cache table for RDMA (if enabled)
+        #[cfg(feature = "rdma")]
+        let page_cache_table = if rdma_manager.is_some() {
+            // Default to 256MB cache (configurable later)
+            let cache_size_mb = 256;
+            let table = crate::worker::handler::PageCacheTable::new(cache_size_mb);
+            info!("Page cache table initialized with max size: {} MB", cache_size_mb);
+            Some(Arc::new(table))
+        } else {
+            None
+        };
+
         // Initialize handler pool (capacity of 1000 per handler type)
         // This pre-allocates handlers to eliminate allocation overhead
         let handler_pool_capacity = 1000;
         #[cfg(feature = "rdma")]
         let handler_pool = Arc::new(
-            HandlerPool::new(handler_pool_capacity, store.clone(), rdma_manager.clone())?
+            HandlerPool::new(handler_pool_capacity, store.clone(), rdma_manager.clone(), page_cache_table.clone())?
         );
         #[cfg(not(feature = "rdma"))]
         let handler_pool = Arc::new(

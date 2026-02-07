@@ -53,6 +53,18 @@ pub struct WorkerMetrics {
     pub(crate) rdma_pool_bytes_allocated: Gauge,
     #[cfg(feature = "rdma")]
     pub(crate) rdma_fallback_to_tcp: Counter,
+
+    // Page cache table metrics
+    #[cfg(feature = "rdma")]
+    pub(crate) page_cache_hits: Counter,
+    #[cfg(feature = "rdma")]
+    pub(crate) page_cache_misses: Counter,
+    #[cfg(feature = "rdma")]
+    pub(crate) page_cache_evictions: Counter,
+    #[cfg(feature = "rdma")]
+    pub(crate) page_cache_size_bytes: Gauge,
+    #[cfg(feature = "rdma")]
+    pub(crate) page_cache_entries: Gauge,
 }
 
 impl WorkerMetrics {
@@ -98,6 +110,32 @@ impl WorkerMetrics {
             rdma_fallback_to_tcp: m::new_counter(
                 "rdma_fallback_to_tcp",
                 "Number of RDMA fallbacks to TCP",
+            )?,
+
+            #[cfg(feature = "rdma")]
+            page_cache_hits: m::new_counter(
+                "page_cache_hits",
+                "RDMA page cache hit count",
+            )?,
+            #[cfg(feature = "rdma")]
+            page_cache_misses: m::new_counter(
+                "page_cache_misses",
+                "RDMA page cache miss count",
+            )?,
+            #[cfg(feature = "rdma")]
+            page_cache_evictions: m::new_counter(
+                "page_cache_evictions",
+                "RDMA page cache eviction count",
+            )?,
+            #[cfg(feature = "rdma")]
+            page_cache_size_bytes: m::new_gauge(
+                "page_cache_size_bytes",
+                "Current RDMA page cache size in bytes",
+            )?,
+            #[cfg(feature = "rdma")]
+            page_cache_entries: m::new_gauge(
+                "page_cache_entries",
+                "Current number of RDMA page cache entries",
             )?,
         };
 

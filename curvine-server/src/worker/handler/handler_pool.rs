@@ -20,6 +20,8 @@
 use crate::worker::block::BlockStore;
 use crate::worker::handler::BlockHandler;
 #[cfg(feature = "rdma")]
+use crate::worker::handler::PageCacheTable;
+#[cfg(feature = "rdma")]
 use crate::worker::rdma::TransferEngineManager;
 use crossbeam::queue::SegQueue;
 use curvine_common::fs::RpcCode;
@@ -37,6 +39,8 @@ pub struct HandlerPool {
     store: BlockStore,
     #[cfg(feature = "rdma")]
     rdma_manager: Option<Arc<TransferEngineManager>>,
+    #[cfg(feature = "rdma")]
+    page_cache_table: Option<Arc<PageCacheTable>>,
 
     capacity: usize,
 }
@@ -49,6 +53,8 @@ impl HandlerPool {
         store: BlockStore,
         #[cfg(feature = "rdma")]
         rdma_manager: Option<Arc<TransferEngineManager>>,
+        #[cfg(feature = "rdma")]
+        page_cache_table: Option<Arc<PageCacheTable>>,
     ) -> FsResult<Self> {
         log::info!(
             "Initializing handler pool with capacity {} per type (lazy allocation)",
@@ -69,6 +75,8 @@ impl HandlerPool {
             store,
             #[cfg(feature = "rdma")]
             rdma_manager,
+            #[cfg(feature = "rdma")]
+            page_cache_table,
             capacity,
         })
     }
@@ -85,6 +93,7 @@ impl HandlerPool {
                 RpcCode::ReadBlock,
                 self.store.clone(),
                 self.rdma_manager.clone(),
+                self.page_cache_table.clone(),
             )?;
 
             #[cfg(not(feature = "rdma"))]
@@ -104,6 +113,7 @@ impl HandlerPool {
                 RpcCode::WriteBlock,
                 self.store.clone(),
                 self.rdma_manager.clone(),
+                self.page_cache_table.clone(),
             )?;
 
             #[cfg(not(feature = "rdma"))]
@@ -123,6 +133,7 @@ impl HandlerPool {
                 RpcCode::WriteBlocksBatch,
                 self.store.clone(),
                 self.rdma_manager.clone(),
+                self.page_cache_table.clone(),
             )?;
 
             #[cfg(not(feature = "rdma"))]
@@ -195,7 +206,7 @@ impl HandlerPool {
     /// Create a new handler on-demand when pool is exhausted
     #[cfg(feature = "rdma")]
     pub fn create_handler(&self, code: RpcCode) -> FsResult<BlockHandler> {
-        BlockHandler::new(code, self.store.clone(), self.rdma_manager.clone())
+        BlockHandler::new(code, self.store.clone(), self.rdma_manager.clone(), self.page_cache_table.clone())
             .map_err(|e| curvine_common::error::FsError::from(e.to_string()))
     }
 
