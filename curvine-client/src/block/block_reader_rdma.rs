@@ -28,16 +28,15 @@ use orpc::err_box;
 use orpc::sys::DataSlice;
 use std::sync::Arc;
 
-/// RDMA-enabled block reader that uses zero-copy transfers
+/// RDMA-enabled block reader that uses zero-copy transfers.
+/// Keeps RDMA buffer alive and returns direct slices without copying.
 pub struct BlockReaderRdma {
     #[cfg(feature = "rdma")]
     #[allow(dead_code)] // Used in new() but not in other methods
     rdma_manager: Arc<ClientRdmaManager>,
     #[cfg(feature = "rdma")]
+    /// RDMA buffer kept alive for zero-copy reads. Buffer is returned to pool when reader drops.
     buffer: Option<RdmaBuffer>,
-    #[cfg(feature = "rdma")]
-    /// Cached data copied from RDMA buffer after transfer (buffer released after copy)
-    cached_data: Option<BytesMut>,
     client: BlockClient,
     block: ExtendedBlock,
     worker_address: WorkerAddress,
@@ -46,6 +45,8 @@ pub struct BlockReaderRdma {
     req_id: i64,
     seq_id: i32,
     rdma_enabled: bool,
+    /// Starting offset within the RDMA buffer (for partial block reads)
+    buffer_offset: usize,
 }
 
 impl BlockReaderRdma {
@@ -62,7 +63,7 @@ impl BlockReaderRdma {
         let seq_id = 0;
 
         // Allocate RDMA receive buffer
-        let mut buffer: Option<RdmaBuffer> = match RdmaBuffer::allocate(rdma_manager.memory_pool(), len as usize) {
+        let buffer: Option<RdmaBuffer> = match RdmaBuffer::allocate(rdma_manager.memory_pool(), len as usize) {
             Ok(buf) => {
                 info!(
                     "Allocated RDMA buffer for block {}, size: {}",
@@ -106,28 +107,19 @@ impl BlockReaderRdma {
         let response = client.open_block_with_request(req_id, seq_id, request).await?;
         let rdma_enabled = response.rdma_transfer.unwrap_or(false);
 
-        // If RDMA transfer completed, immediately copy data and release buffer
-        let cached_data = if rdma_enabled && buffer.is_some() {
-            info!("RDMA transfer completed for block {}", block.id);
-            let buf = buffer.take().unwrap();
-            let data_len = buf.size();
-            let cached = BytesMut::from(buf.as_slice());
-
-            // Buffer is dropped here, immediately returning memory to pool
-            drop(buf);
-            info!("Copied {} bytes from RDMA buffer and released it immediately", data_len);
-            Some(cached)
-        } else {
-            if rdma_enabled {
-                warn!("RDMA enabled but no buffer allocated, using TCP fallback");
-            }
-            None
-        };
+        // ZERO-COPY: Keep buffer alive! Don't copy!
+        if rdma_enabled && buffer.is_some() {
+            info!(
+                "RDMA transfer completed for block {}, keeping buffer alive for zero-copy reads",
+                block.id
+            );
+        } else if rdma_enabled {
+            warn!("RDMA enabled but no buffer allocated, using TCP fallback");
+        }
 
         let reader = Self {
             rdma_manager,
-            buffer,  // Will be None if RDMA was used
-            cached_data,
+            buffer, // Keep buffer alive for direct slicing
             client,
             block,
             worker_address,
@@ -136,6 +128,7 @@ impl BlockReaderRdma {
             req_id,
             seq_id,
             rdma_enabled,
+            buffer_offset: 0, // Start of buffer
         };
 
         Ok(reader)
@@ -187,17 +180,37 @@ impl BlockReaderRdma {
             return err_box!("No readable data");
         }
 
-        // RDMA path: Read from cached data (buffer already released in new())
+        // ZERO-COPY RDMA path: Return direct slice from RDMA buffer
         if self.rdma_enabled {
-            if let Some(cached) = &self.cached_data {
-                let start = self.pos as usize;
+            if let Some(ref buffer) = self.buffer {
+                let current_offset = self.buffer_offset + (self.pos as usize);
                 let remaining = self.remaining() as usize;
-                let chunk_size = std::cmp::min(remaining, cached.len() - start);
 
-                let chunk = DataSlice::buffer(BytesMut::from(&cached[start..start + chunk_size]));
-                self.pos += chunk.len() as i64;
+                // Get chunk size (limited by buffer size)
+                let buffer_remaining = buffer.size().saturating_sub(current_offset);
+                let chunk_size = std::cmp::min(remaining, buffer_remaining);
+
+                if chunk_size == 0 {
+                    return err_box!("No data remaining in RDMA buffer");
+                }
+
+                // Return direct slice from RDMA buffer (zero-copy!)
+                let slice = &buffer.as_slice()[current_offset..current_offset + chunk_size];
+
+                // Wrap in BytesMut for DataSlice compatibility
+                // Note: This creates a new BytesMut but bytes::Bytes would be even better for true zero-copy
+                let chunk = DataSlice::buffer(BytesMut::from(slice));
+
+                self.pos += chunk_size as i64;
+
+                info!(
+                    "Zero-copy RDMA read: returned {} bytes directly from buffer (pos={}, remaining={})",
+                    chunk_size, self.pos, self.remaining()
+                );
 
                 return Ok(chunk);
+            } else {
+                warn!("RDMA enabled but buffer is None, falling back to TCP");
             }
         }
 

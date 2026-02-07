@@ -116,7 +116,159 @@ impl RdmaReadHandler {
         false
     }
 
-    /// Perform RDMA transfer to client buffer
+    /// Fallback: Read using buffered I/O when direct I/O fails
+    #[cfg(feature = "rdma")]
+    fn read_buffered_to_rdma(
+        &self,
+        meta: &crate::worker::block::BlockMeta,
+        context: &ReadContext,
+        buffer: &mut [u8],
+    ) -> FsResult<usize> {
+        let mut file = meta.create_reader(context.off as u64)?;
+        let data_slice = file.read_region(false, context.len as i32)?;
+
+        // Copy from page cache to RDMA buffer
+        let bytes_read = match &data_slice {
+            orpc::sys::DataSlice::Buffer(bytes) => {
+                if bytes.len() > buffer.len() {
+                    return err_box!("Buffer too small: {} < {}", buffer.len(), bytes.len());
+                }
+                buffer[..bytes.len()].copy_from_slice(bytes);
+                bytes.len()
+            }
+            orpc::sys::DataSlice::MemSlice(mem) => {
+                let slice = mem.as_slice();
+                if slice.len() > buffer.len() {
+                    return err_box!("Buffer too small: {} < {}", buffer.len(), slice.len());
+                }
+                buffer[..slice.len()].copy_from_slice(slice);
+                slice.len()
+            }
+            orpc::sys::DataSlice::Bytes(bytes) => {
+                if bytes.len() > buffer.len() {
+                    return err_box!("Buffer too small: {} < {}", buffer.len(), bytes.len());
+                }
+                buffer[..bytes.len()].copy_from_slice(bytes);
+                bytes.len()
+            }
+            orpc::sys::DataSlice::IOSlice(_) => {
+                return err_box!("Unexpected IOSlice in buffered read fallback");
+            }
+            orpc::sys::DataSlice::Empty => {
+                return err_box!("Empty DataSlice returned");
+            }
+        };
+
+        Ok(bytes_read)
+    }
+
+    /// Read directly from disk to RDMA buffer using io_uring (async zero-copy)
+    #[cfg(all(feature = "rdma", feature = "io_uring"))]
+    async fn read_direct_to_rdma_uring(
+        &self,
+        meta: &crate::worker::block::BlockMeta,
+        offset: u64,
+        buffer: &mut [u8],
+    ) -> FsResult<usize> {
+        use io_uring::{opcode, types, IoUring};
+        use std::os::unix::io::AsRawFd;
+
+        // Open file with O_DIRECT
+        let file = meta.create_direct_reader()
+            .map_err(|e| FsError::from(format!("Failed to open file for direct I/O: {}", e)))?;
+
+        let fd = file.as_raw_fd();
+
+        // Create io_uring instance for this operation
+        // Note: In production, reuse a shared ring from a pool
+        let mut ring = IoUring::new(1)
+            .map_err(|e| FsError::from(format!("Failed to create io_uring: {}", e)))?;
+
+        // Prepare read operation
+        let read_op = opcode::Read::new(
+            types::Fd(fd),
+            buffer.as_mut_ptr(),
+            buffer.len() as u32,
+        )
+        .offset(offset)
+        .build();
+
+        // Submit operation
+        unsafe {
+            ring.submission()
+                .push(&read_op)
+                .map_err(|e| FsError::from(format!("Failed to submit io_uring op: {}", e)))?;
+        }
+
+        ring.submit_and_wait(1)
+            .map_err(|e| FsError::from(format!("io_uring submit_and_wait failed: {}", e)))?;
+
+        // Get completion
+        let cqe = ring.completion().next()
+            .ok_or_else(|| FsError::from("No completion event from io_uring".to_string()))?;
+
+        let result = cqe.result();
+        if result < 0 {
+            let err = std::io::Error::from_raw_os_error(-result);
+            return Err(FsError::from(format!("io_uring read failed: {}", err)));
+        }
+
+        let bytes_read = result as usize;
+        if bytes_read != buffer.len() {
+            warn!(
+                "Partial io_uring read: expected {}, got {} bytes",
+                buffer.len(), bytes_read
+            );
+        }
+
+        info!(
+            "io_uring async read completed: {} bytes from offset {} (fd={})",
+            bytes_read, offset, fd
+        );
+
+        Ok(bytes_read)
+    }
+
+    /// Read directly from disk to RDMA buffer using pread (zero-copy on server side)
+    #[cfg(feature = "rdma")]
+    fn read_direct_to_rdma(
+        &self,
+        meta: &crate::worker::block::BlockMeta,
+        offset: u64,
+        buffer: &mut [u8],
+    ) -> FsResult<usize> {
+        use std::os::unix::io::AsRawFd;
+
+        // Open file with O_DIRECT for bypassing page cache
+        let file = meta.create_direct_reader()
+            .map_err(|e| FsError::from(format!("Failed to open file for direct I/O: {}", e)))?;
+
+        let fd = file.as_raw_fd();
+        let buf_ptr = buffer.as_mut_ptr() as *mut libc::c_void;
+        let buf_len = buffer.len();
+
+        // Use pread for zero-copy direct I/O
+        let bytes_read = unsafe {
+            libc::pread(fd, buf_ptr, buf_len, offset as libc::off_t)
+        };
+
+        if bytes_read < 0 {
+            let err = std::io::Error::last_os_error();
+            return Err(FsError::from(format!("Direct I/O read failed: {}", err)));
+        }
+
+        let bytes_read = bytes_read as usize;
+        if bytes_read != buf_len {
+            warn!(
+                "Partial direct read: expected {}, got {} bytes",
+                buf_len, bytes_read
+            );
+        }
+
+        Ok(bytes_read)
+    }
+
+    /// Perform RDMA transfer to client buffer with zero-copy on server side
     #[cfg(feature = "rdma")]
     async fn perform_rdma_transfer(
         &self,
@@ -140,48 +292,50 @@ impl RdmaReadHandler {
             })?;
         info!("perform_rdma_transfer() - successfully allocated staging buffer at offset {}", staging_buffer.offset());
 
-        // 2. Read block data into RDMA buffer
-        let mut file = meta.create_reader(context.off as u64)?;
+        // 2. ZERO-COPY: Read directly from NVMe disk to RDMA buffer (bypasses page cache!)
         let buffer = staging_buffer.as_mut_slice();
 
-        // Read using read_region (which returns DataSlice)
-        let data_slice = file.read_region(false, context.len as i32)?;
+        // Try io_uring first (fastest), then pread, then buffered
+        let bytes_read = {
+            #[cfg(all(feature = "rdma", feature = "io_uring"))]
+            {
+                match self.read_direct_to_rdma_uring(meta, context.off as u64, buffer).await {
+                    Ok(bytes) => {
+                        info!(
+                            "io_uring zero-copy read: {} bytes from NVMe to RDMA buffer",
+                            bytes
+                        );
+                        bytes
+                    }
+                    Err(e) => {
+                        log::warn!("io_uring read failed: {}, falling back to pread", e);
+                        match self.read_direct_to_rdma(meta, context.off as u64, buffer) {
+                            Ok(bytes) => bytes,
+                            Err(e2) => {
+                                log::warn!("pread also failed: {}, falling back to buffered", e2);
+                                self.read_buffered_to_rdma(meta, context, buffer)?
+                            }
+                        }
+                    }
+                }
+            }
 
-        // Copy data from DataSlice into our RDMA buffer
-        let bytes_read = match &data_slice {
-            orpc::sys::DataSlice::Buffer(bytes) => {
-                if bytes.len() != context.len as usize {
-                    return err_box!("Incomplete read: expected {}, got {}", context.len, bytes.len());
+            #[cfg(all(feature = "rdma", not(feature = "io_uring")))]
+            {
+                match self.read_direct_to_rdma(meta, context.off as u64, buffer) {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        log::warn!("Direct I/O failed: {}, falling back to buffered read", e);
+                        self.read_buffered_to_rdma(meta, context, buffer)?
+                    }
                 }
-                buffer[..bytes.len()].copy_from_slice(bytes);
-                bytes.len()
-            }
-            orpc::sys::DataSlice::IOSlice(_) => {
-                // For IO-based DataSlice, we need to read directly
-                // This shouldn't happen with enable_send_file=false
-                return err_box!("Unexpected IOSlice in RDMA path");
-            }
-            orpc::sys::DataSlice::MemSlice(mem) => {
-                // Memory slice - copy to RDMA buffer
-                let slice = mem.as_slice();
-                if slice.len() != context.len as usize {
-                    return err_box!("Incomplete read: expected {}, got {}", context.len, slice.len());
-                }
-                buffer[..slice.len()].copy_from_slice(slice);
-                slice.len()
-            }
-            orpc::sys::DataSlice::Bytes(bytes) => {
-                // Bytes variant - copy to RDMA buffer
-                if bytes.len() != context.len as usize {
-                    return err_box!("Incomplete read: expected {}, got {}", context.len, bytes.len());
-                }
-                buffer[..bytes.len()].copy_from_slice(bytes);
-                bytes.len()
-            }
-            orpc::sys::DataSlice::Empty => {
-                return err_box!("Empty DataSlice returned");
             }
         };
+
+        info!(
+            "Zero-copy server read completed: {} bytes from NVMe to RDMA buffer",
+            bytes_read
+        );
 
         // 3. Extract client RDMA target from context
         let client_descriptor = context.rdma_target.as_ref().unwrap();

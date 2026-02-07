@@ -10,6 +10,7 @@ license.workspace = true
 default = []
 jni = ["curvine-ufs/jni"]
 rdma = ["curvine-common/rdma", "fabric-lib", "cuda-lib"]
+io_uring = ["dep:io-uring"]
 
 [dependencies]
 orpc = { workspace = true }
@@ -48,10 +49,14 @@ url = { workspace = true }
 parking_lot = { workspace = true }
 lru = { workspace = true }
 crossbeam = { workspace = true }
+libc = { workspace = true }
 
 # RDMA support
 fabric-lib = { path = "../../pplx-garden/fabric-lib", optional = true, features = ["tokio"] }
 cuda-lib = { path = "../../pplx-garden/rust/cuda-lib", optional = true }
+
+# io_uring support for zero-copy async I/O
+io-uring = { version = "0.6", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 curvine-s3-gateway = { workspace = true }

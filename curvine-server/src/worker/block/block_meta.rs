@@ -225,6 +225,34 @@ impl BlockMeta {
         LocalFile::with_read(self.get_block_file()?, offset)
     }
 
+    /// Create reader with O_DIRECT flag for zero-copy direct I/O to RDMA buffers.
+    /// This bypasses page cache and reads directly into the provided buffer.
+    #[cfg(target_os = "linux")]
+    pub fn create_direct_reader(&self) -> std::io::Result<std::fs::File> {
+        use std::fs::OpenOptions;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let path = self.get_block_file()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(path)
+            .map_err(|e| std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to open file with O_DIRECT: {}", e)
+            ))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn create_direct_reader(&self) -> std::io::Result<std::fs::File> {
+        // Non-Linux systems: fall back to regular file I/O
+        let path = self.get_block_file()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        std::fs::File::open(path)
+    }
+
     pub fn dir_id(&self) -> u32 {
         self.dir.dir_id
     }
