@@ -18,6 +18,8 @@
 use crate::worker::rdma::TransferEngineManager;
 #[cfg(feature = "rdma")]
 use crate::worker::handler::rdma_page_cache::PageCacheRdmaRegistration;
+#[cfg(feature = "rdma")]
+use crate::worker::handler::rdma_page_cache_table::{PageCacheTable, PageCacheKey};
 use crate::worker::block::BlockStore;
 use crate::worker::handler::ReadContext;
 use crate::worker::{Worker, WorkerMetrics};
@@ -36,6 +38,8 @@ pub struct RdmaReadHandler {
     pub(crate) store: BlockStore,
     #[cfg(feature = "rdma")]
     pub(crate) rdma_manager: Option<Arc<TransferEngineManager>>,
+    #[cfg(feature = "rdma")]
+    pub(crate) page_cache_table: Option<Arc<PageCacheTable>>,
     pub(crate) context: Option<ReadContext>,
     pub(crate) file: Option<LocalFile>,
     pub(crate) metrics: &'static WorkerMetrics,
@@ -45,20 +49,29 @@ pub struct RdmaReadHandler {
 
 impl RdmaReadHandler {
     #[cfg(feature = "rdma")]
-    pub fn new(store: BlockStore, rdma_manager: Option<Arc<TransferEngineManager>>) -> Self {
+    pub fn new(
+        store: BlockStore,
+        rdma_manager: Option<Arc<TransferEngineManager>>,
+        page_cache_table: Option<Arc<PageCacheTable>>,
+    ) -> Self {
         let metrics = Worker::get_metrics();
         let conf = Worker::get_conf();
-        
+
         if rdma_manager.is_some() {
-            info!("RdmaReadHandler created WITH RDMA manager, threshold={}", 
+            info!("RdmaReadHandler created WITH RDMA manager, threshold={}",
                   conf.worker.rdma.rdma_inline_threshold);
         } else {
             info!("RdmaReadHandler created WITHOUT RDMA manager (will use TCP only)");
         }
-        
+
+        if page_cache_table.is_some() {
+            info!("RdmaReadHandler created WITH page cache table");
+        }
+
         Self {
             store,
             rdma_manager,
+            page_cache_table,
             context: None,
             file: None,
             metrics,
@@ -84,6 +97,61 @@ impl RdmaReadHandler {
 
     /// Check if RDMA should be used for this request
     #[cfg(feature = "rdma")]
+    /// Read data into page cache and register for RDMA
+    #[cfg(feature = "rdma")]
+    fn read_and_register_page_cache(
+        &self,
+        context: &ReadContext,
+        meta: &crate::worker::block::BlockMeta,
+        rdma_manager: &Arc<TransferEngineManager>,
+    ) -> FsResult<PageCacheRdmaRegistration> {
+        // 1. Read data into page cache (normal buffered read)
+        let mut file = meta.create_reader(context.off as u64)?;
+        let data_slice = file.read_region(false, context.len as i32)?;
+
+        // Extract bytes from DataSlice
+        let data_bytes = match &data_slice {
+            orpc::sys::DataSlice::Buffer(bytes) => bytes.as_ref(),
+            orpc::sys::DataSlice::MemSlice(mem) => mem.as_slice(),
+            orpc::sys::DataSlice::Bytes(bytes) => bytes.as_ref(),
+            orpc::sys::DataSlice::IOSlice(_) => {
+                return err_box!("Unexpected IOSlice in page cache RDMA path");
+            }
+            orpc::sys::DataSlice::Empty => {
+                return err_box!("Empty DataSlice returned from read");
+            }
+        };
+
+        if data_bytes.len() != context.len as usize {
+            return err_box!(
+                "Incomplete read: expected {}, got {}",
+                context.len,
+                data_bytes.len()
+            );
+        }
+
+        info!(
+            "Read {} bytes into page cache, now registering for RDMA",
+            data_bytes.len()
+        );
+
+        // 2. Register page cache memory for RDMA
+        let registration = PageCacheRdmaRegistration::register(
+            rdma_manager.clone(),
+            data_bytes,
+        ).map_err(|e| {
+            warn!("Failed to register page cache for RDMA: {}, falling back", e);
+            FsError::from(format!("Page cache registration failed: {}", e))
+        })?;
+
+        info!(
+            "Successfully registered page cache memory for RDMA transfer (handle={:?})",
+            registration.handle()
+        );
+
+        Ok(registration)
+    }
+
     fn should_use_rdma(&self, context: &ReadContext) -> bool {
         // Check if RDMA is enabled
         if self.rdma_manager.is_none() {
@@ -281,74 +349,75 @@ impl RdmaReadHandler {
     ) -> FsResult<Message> {
         let rdma_manager = self.rdma_manager.as_ref().unwrap();
 
-        info!(
-            "perform_rdma_transfer_from_page_cache() - reading {} bytes into page cache",
-            context.len
+        // Create cache key
+        let cache_key = PageCacheKey::new(
+            context.block_id,
+            context.off as u64,
+            context.len as usize,
         );
 
-        // 1. Read data into page cache (normal buffered read)
-        let mut file = meta.create_reader(context.off as u64)?;
-        let data_slice = file.read_region(false, context.len as i32)?;
+        // Check if we have a cached registration
+        let registration: Arc<PageCacheRdmaRegistration> = if let Some(ref cache_table) = self.page_cache_table {
+            if let Some(entry) = cache_table.get(&cache_key) {
+                info!(
+                    "✓ Page cache HIT: block_id={}, offset={}, len={} - reusing cached RDMA registration",
+                    context.block_id, context.off, context.len
+                );
+                // Cache hit - use existing registration
+                entry.registration.clone()
+            } else {
+                info!(
+                    "✗ Page cache MISS: block_id={}, offset={}, len={} - reading and registering",
+                    context.block_id, context.off, context.len
+                );
 
-        // Extract bytes from DataSlice
-        let data_bytes = match &data_slice {
-            orpc::sys::DataSlice::Buffer(bytes) => bytes.as_ref(),
-            orpc::sys::DataSlice::MemSlice(mem) => mem.as_slice(),
-            orpc::sys::DataSlice::Bytes(bytes) => bytes.as_ref(),
-            orpc::sys::DataSlice::IOSlice(_) => {
-                return err_box!("Unexpected IOSlice in page cache RDMA path");
+                // Cache miss - read data and register
+                let registration = self.read_and_register_page_cache(context, meta, rdma_manager)?;
+                let registration_arc = Arc::new(registration);
+
+                // Insert into cache (keep it alive for future reads)
+                if cache_table.insert(cache_key, registration_arc.clone()) {
+                    info!(
+                        "✓ Cached RDMA registration for block_id={}, offset={}, len={}",
+                        context.block_id, context.off, context.len
+                    );
+                } else {
+                    warn!(
+                        "✗ Failed to cache RDMA registration (cache full?), will be dropped after transfer"
+                    );
+                }
+
+                registration_arc
             }
-            orpc::sys::DataSlice::Empty => {
-                return err_box!("Empty DataSlice returned from read");
-            }
+        } else {
+            // No cache table - register temporarily
+            info!(
+                "Page cache table disabled - registering temporarily for block_id={}, offset={}, len={}",
+                context.block_id, context.off, context.len
+            );
+            let registration = self.read_and_register_page_cache(context, meta, rdma_manager)?;
+            Arc::new(registration)
         };
 
-        if data_bytes.len() != context.len as usize {
-            return err_box!(
-                "Incomplete read: expected {}, got {}",
-                context.len,
-                data_bytes.len()
-            );
-        }
-
-        info!(
-            "Read {} bytes into page cache, now registering for RDMA",
-            data_bytes.len()
-        );
-
-        // 2. Register page cache memory for RDMA (temporarily)
-        let registration = PageCacheRdmaRegistration::register(
-            rdma_manager.clone(),
-            data_bytes,
-        ).map_err(|e| {
-            log::warn!("Failed to register page cache for RDMA: {}, falling back", e);
-            FsError::from(format!("Page cache registration failed: {}", e))
-        })?;
-
-        info!(
-            "Successfully registered page cache memory for RDMA transfer (handle={:?})",
-            registration.handle()
-        );
-
-        // 3. Extract client RDMA target
+        // Extract client RDMA target
         let client_descriptor = context.rdma_target.as_ref().unwrap();
         let client_offset = context.rdma_target_offset;
 
-        // 4. RDMA write directly from page cache to client
+        // RDMA write directly from page cache to client
         let src_handle = registration.handle();
         let src_offset = registration.offset();
         let dst_descriptor = client_descriptor.clone().into();
 
         info!(
             "Submitting RDMA write from page cache: block_id={}, bytes={}, dst_offset={}",
-            context.block_id, data_bytes.len(), client_offset
+            context.block_id, context.len, client_offset
         );
 
         // Perform RDMA write
         rdma_manager.submit_write_async(
             src_handle,
             src_offset,
-            data_bytes.len() as u64,
+            context.len as u64,
             dst_descriptor,
             client_offset,
         ).await.map_err(|e| {
@@ -356,17 +425,15 @@ impl RdmaReadHandler {
             FsError::from(e.to_string())
         })?;
 
-        // 5. Success - RDMA transfer completed
+        // Success - RDMA transfer completed
         info!(
-            "RDMA write from page cache completed: block {}, {} bytes",
-            context.block_id, data_bytes.len()
+            "✓ RDMA write from page cache completed: block {}, {} bytes",
+            context.block_id, context.len
         );
         self.metrics.rdma_transfers_total.inc();
-        self.metrics.rdma_bytes_written.inc_by(data_bytes.len() as i64);
+        self.metrics.rdma_bytes_written.inc_by(context.len as i64);
 
-        // Registration automatically deregisters on drop
-        drop(registration);
-        info!("Page cache RDMA memory deregistered");
+        // Note: Registration stays in cache (or drops if not cached)
 
         // Build success response
         let response = BlockReadResponse {

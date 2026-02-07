@@ -54,7 +54,10 @@ fn test_rdma_config_parsing() -> CommonResult<()> {
     std::fs::write(&config_path, toml_content)?;
 
     // Load and verify
+    #[cfg(feature = "rdma")]
     let conf = ClusterConf::from(config_path.to_str().unwrap().to_string())?;
+    #[cfg(not(feature = "rdma"))]
+    let _conf = ClusterConf::from(config_path.to_str().unwrap().to_string())?;
 
     #[cfg(feature = "rdma")]
     {
@@ -91,7 +94,10 @@ fn test_rdma_config_defaults() -> CommonResult<()> {
     let config_path = temp_dir.path().join("test-defaults.toml");
     std::fs::write(&config_path, toml_content)?;
 
+    #[cfg(feature = "rdma")]
     let conf = ClusterConf::from(config_path.to_str().unwrap().to_string())?;
+    #[cfg(not(feature = "rdma"))]
+    let _conf = ClusterConf::from(config_path.to_str().unwrap().to_string())?;
 
     // Verify RDMA is disabled by default
     #[cfg(feature = "rdma")]

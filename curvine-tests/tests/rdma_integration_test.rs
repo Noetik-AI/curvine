@@ -65,7 +65,8 @@ fn test_file_operations_rdma_disabled() -> CommonResult<()> {
     }
 
     let cluster = testing.start_cluster()?;
-    let fs = CurvineFileSystem::with_conf(conf)?;
+    let client_rt = Arc::new(conf.client_rpc_conf().create_runtime());
+    let fs = CurvineFileSystem::with_rt(conf, client_rt)?;
 
     // Create test file
     let path = Path::from_str("/rdma_disabled_test.dat")?;

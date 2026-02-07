@@ -27,30 +27,32 @@ use fabric_lib::api::{MemoryRegionDescriptor as FabricDescriptor, MemoryRegionHa
 #[cfg(feature = "rdma")]
 use fabric_lib::RdmaEngine;
 
-/// Temporary RDMA registration for page cache memory.
+/// RDMA registration that owns the page cache data.
+/// Keeps data alive and registered for the lifetime of this struct.
 /// Automatically deregisters when dropped.
 #[cfg(feature = "rdma")]
 pub struct PageCacheRdmaRegistration {
     handle: MemoryRegionHandle,
     descriptor: FabricDescriptor,
-    ptr: *const u8,
-    len: usize,
+    data: Vec<u8>,  // Own the data to keep it alive!
     rdma_manager: Arc<TransferEngineManager>,
 }
 
 #[cfg(feature = "rdma")]
 impl PageCacheRdmaRegistration {
     /// Register page cache memory region for RDMA.
-    /// The memory must remain valid for the lifetime of this registration.
+    /// Takes ownership of the data to ensure it remains valid.
     pub fn register(
         rdma_manager: Arc<TransferEngineManager>,
         data: &[u8],
     ) -> Result<Self, String> {
-        let ptr = data.as_ptr();
-        let len = data.len();
+        // Copy data into owned buffer (ensures it stays alive)
+        let mut owned_data = data.to_vec();
+        let ptr = owned_data.as_mut_ptr();
+        let len = owned_data.len();
 
         info!(
-            "Registering page cache memory for RDMA: ptr={:p}, len={}",
+            "Registering page cache memory for RDMA: ptr={:p}, len={} bytes",
             ptr, len
         );
 
@@ -69,7 +71,7 @@ impl PageCacheRdmaRegistration {
         let (handle, descriptor) = rdma_manager
             .engine()
             .register_memory_allow_remote(
-                std::ptr::NonNull::new(ptr as *mut u8)
+                std::ptr::NonNull::new(ptr)
                     .ok_or_else(|| "Null pointer in page cache".to_string())?
                     .cast(),
                 len,
@@ -78,15 +80,14 @@ impl PageCacheRdmaRegistration {
             .map_err(|e| format!("Failed to register page cache for RDMA: {}", e))?;
 
         info!(
-            "Successfully registered page cache as RDMA memory region: handle={:?}, len={}",
+            "Successfully registered page cache as RDMA memory region: handle={:?}, len={} bytes",
             handle, len
         );
 
         Ok(Self {
             handle,
             descriptor,
-            ptr,
-            len,
+            data: owned_data,  // Store owned data
             rdma_manager,
         })
     }
@@ -100,36 +101,44 @@ impl PageCacheRdmaRegistration {
     }
 
     pub fn len(&self) -> usize {
-        self.len
+        self.data.len()
     }
 
     pub fn descriptor(&self) -> &FabricDescriptor {
         &self.descriptor
+    }
+
+    /// Get raw pointer to the owned data (for RDMA operations)
+    pub fn as_ptr(&self) -> *const u8 {
+        self.data.as_ptr()
     }
 }
 
 #[cfg(feature = "rdma")]
 impl Drop for PageCacheRdmaRegistration {
     fn drop(&mut self) {
-        // Deregister from RDMA NIC using the original pointer
-        let ptr = std::ptr::NonNull::new(self.ptr as *mut u8)
+        let ptr = self.data.as_mut_ptr();
+        let len = self.data.len();
+
+        // Deregister from RDMA NIC
+        let ptr_nn = std::ptr::NonNull::new(ptr)
             .expect("Null pointer during deregistration")
             .cast();
-        if let Err(e) = self.rdma_manager.engine().unregister_memory(ptr) {
+        if let Err(e) = self.rdma_manager.engine().unregister_memory(ptr_nn) {
             warn!("Failed to unregister page cache RDMA region: {}", e);
         }
 
         // Unlock pages
         #[cfg(target_os = "linux")]
         unsafe {
-            let result = libc::munlock(self.ptr as *const libc::c_void, self.len);
+            let result = libc::munlock(ptr as *const libc::c_void, len);
             if result != 0 {
                 let err = std::io::Error::last_os_error();
                 warn!("Failed to munlock page cache memory: {}", err);
             }
         }
 
-        info!("Deregistered page cache RDMA memory region: len={}", self.len);
+        info!("Deregistered page cache RDMA memory region: len={} bytes", len);
     }
 }
 
