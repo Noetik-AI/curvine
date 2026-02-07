@@ -16,6 +16,8 @@
 
 #[cfg(feature = "rdma")]
 use crate::worker::rdma::TransferEngineManager;
+#[cfg(feature = "rdma")]
+use crate::worker::handler::rdma_page_cache::PageCacheRdmaRegistration;
 use crate::worker::block::BlockStore;
 use crate::worker::handler::ReadContext;
 use crate::worker::{Worker, WorkerMetrics};
@@ -268,7 +270,118 @@ impl RdmaReadHandler {
         Ok(bytes_read)
     }
 
-    /// Perform RDMA transfer to client buffer with zero-copy on server side
+    /// Perform RDMA transfer using page cache (superior approach).
+    /// Reads data into OS page cache, registers it as RDMA memory, transfers directly.
+    #[cfg(feature = "rdma")]
+    async fn perform_rdma_transfer_from_page_cache(
+        &self,
+        msg: &Message,
+        context: &ReadContext,
+        meta: &crate::worker::block::BlockMeta,
+    ) -> FsResult<Message> {
+        let rdma_manager = self.rdma_manager.as_ref().unwrap();
+
+        info!(
+            "perform_rdma_transfer_from_page_cache() - reading {} bytes into page cache",
+            context.len
+        );
+
+        // 1. Read data into page cache (normal buffered read)
+        let mut file = meta.create_reader(context.off as u64)?;
+        let data_slice = file.read_region(false, context.len as i32)?;
+
+        // Extract bytes from DataSlice
+        let data_bytes = match &data_slice {
+            orpc::sys::DataSlice::Buffer(bytes) => bytes.as_ref(),
+            orpc::sys::DataSlice::MemSlice(mem) => mem.as_slice(),
+            orpc::sys::DataSlice::Bytes(bytes) => bytes.as_ref(),
+            orpc::sys::DataSlice::IOSlice(_) => {
+                return err_box!("Unexpected IOSlice in page cache RDMA path");
+            }
+            orpc::sys::DataSlice::Empty => {
+                return err_box!("Empty DataSlice returned from read");
+            }
+        };
+
+        if data_bytes.len() != context.len as usize {
+            return err_box!(
+                "Incomplete read: expected {}, got {}",
+                context.len,
+                data_bytes.len()
+            );
+        }
+
+        info!(
+            "Read {} bytes into page cache, now registering for RDMA",
+            data_bytes.len()
+        );
+
+        // 2. Register page cache memory for RDMA (temporarily)
+        let registration = PageCacheRdmaRegistration::register(
+            rdma_manager.clone(),
+            data_bytes,
+        ).map_err(|e| {
+            log::warn!("Failed to register page cache for RDMA: {}, falling back", e);
+            FsError::from(format!("Page cache registration failed: {}", e))
+        })?;
+
+        info!(
+            "Successfully registered page cache memory for RDMA transfer (handle={:?})",
+            registration.handle()
+        );
+
+        // 3. Extract client RDMA target
+        let client_descriptor = context.rdma_target.as_ref().unwrap();
+        let client_offset = context.rdma_target_offset;
+
+        // 4. RDMA write directly from page cache to client
+        let src_handle = registration.handle();
+        let src_offset = registration.offset();
+        let dst_descriptor = client_descriptor.clone().into();
+
+        info!(
+            "Submitting RDMA write from page cache: block_id={}, bytes={}, dst_offset={}",
+            context.block_id, data_bytes.len(), client_offset
+        );
+
+        // Perform RDMA write
+        rdma_manager.submit_write_async(
+            src_handle,
+            src_offset,
+            data_bytes.len() as u64,
+            dst_descriptor,
+            client_offset,
+        ).await.map_err(|e| {
+            warn!("RDMA write from page cache failed: {}", e);
+            FsError::from(e.to_string())
+        })?;
+
+        // 5. Success - RDMA transfer completed
+        info!(
+            "RDMA write from page cache completed: block {}, {} bytes",
+            context.block_id, data_bytes.len()
+        );
+        self.metrics.rdma_transfers_total.inc();
+        self.metrics.rdma_bytes_written.inc_by(data_bytes.len() as i64);
+
+        // Registration automatically deregisters on drop
+        drop(registration);
+        info!("Page cache RDMA memory deregistered");
+
+        // Build success response
+        let response = BlockReadResponse {
+            id: context.block_id,
+            len: meta.len,
+            path: None,
+            storage_type: meta.storage_type().into(),
+            rdma_transfer: Some(true),
+        };
+
+        Ok(Builder::success(msg).proto_header(response).build())
+    }
+
+    /// Perform RDMA transfer to client buffer with zero-copy on server side.
+    /// This is the fallback approach using pre-allocated staging buffers.
     #[cfg(feature = "rdma")]
     async fn perform_rdma_transfer(
         &self,
@@ -416,20 +529,35 @@ impl RdmaReadHandler {
                 );
                 self.metrics.rdma_enabled.set(1);
 
-                // Attempt RDMA transfer (block on async operation)
+                // Try page cache approach first (superior - leverages OS cache)
                 let rdma_result = tokio::runtime::Handle::current()
-                    .block_on(self.perform_rdma_transfer(msg, &context, &meta));
+                    .block_on(self.perform_rdma_transfer_from_page_cache(msg, &context, &meta));
 
                 match rdma_result {
                     Ok(response) => {
                         let _ = self.context.replace(context);
-                        info!("RDMA open() - SUCCESS: RDMA transfer completed, context set, req_id: {}", req_id);
+                        info!("RDMA open() - SUCCESS: Page cache RDMA transfer completed, context set, req_id: {}", req_id);
                         return Ok(response);
                     }
                     Err(e) => {
-                        warn!("RDMA open() - RDMA transfer FAILED for req_id: {}: {}, falling back to TCP", req_id, e);
-                        self.metrics.rdma_fallback_to_tcp.inc();
-                        // Fall through to TCP path below
+                        warn!("RDMA open() - Page cache RDMA failed for req_id: {}: {}, trying staging buffer approach", req_id, e);
+
+                        // Fallback: Try staging buffer approach (direct I/O)
+                        let staging_result = tokio::runtime::Handle::current()
+                            .block_on(self.perform_rdma_transfer(msg, &context, &meta));
+
+                        match staging_result {
+                            Ok(response) => {
+                                let _ = self.context.replace(context);
+                                info!("RDMA open() - SUCCESS: Staging buffer RDMA transfer completed, context set, req_id: {}", req_id);
+                                return Ok(response);
+                            }
+                            Err(e2) => {
+                                warn!("RDMA open() - All RDMA approaches failed for req_id: {}: {}, falling back to TCP", req_id, e2);
+                                self.metrics.rdma_fallback_to_tcp.inc();
+                                // Fall through to TCP path below
+                            }
+                        }
                     }
                 }
             }

@@ -38,5 +38,8 @@ mod rdma_read_handler;
 #[cfg(feature = "rdma")]
 pub use self::rdma_read_handler::RdmaReadHandler;
 
+#[cfg(feature = "rdma")]
+mod rdma_page_cache;
+
 mod handler_pool;
 pub use self::handler_pool::{HandlerPool, HandlerPoolStats};

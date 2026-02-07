@@ -103,6 +103,12 @@ impl TransferEngineManager {
         &self.memory_pool
     }
 
+    /// Get direct access to the transfer engine for custom memory registration.
+    /// Used for registering page cache memory as RDMA-capable.
+    pub fn engine(&self) -> &Arc<TransferEngine> {
+        &self.engine
+    }
+
     /// Submit an RDMA write transfer asynchronously
     pub async fn submit_write_async(
         &self,
