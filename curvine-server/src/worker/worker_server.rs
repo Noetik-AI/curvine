@@ -82,10 +82,13 @@ impl WorkerService {
         // Initialize page cache table for RDMA (if enabled)
         #[cfg(feature = "rdma")]
         let page_cache_table = if rdma_manager.is_some() {
-            // Default to 256MB cache (configurable later)
-            let cache_size_mb = 256;
+            let cache_size_mb = conf.worker.rdma.rdma_page_cache_max_size_mb;
             let table = crate::worker::handler::PageCacheTable::new(cache_size_mb);
-            info!("Page cache table initialized with max size: {} MB", cache_size_mb);
+            info!(
+                "Page cache table initialized with max size: {} MB ({:.1} GB)",
+                cache_size_mb,
+                cache_size_mb as f64 / 1024.0
+            );
             Some(Arc::new(table))
         } else {
             None

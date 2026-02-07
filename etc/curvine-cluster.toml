@@ -39,12 +39,13 @@ enable_s3_gateway = false
 
 # RDMA configuration for worker
 [worker.rdma]
-enable_rdma = true                  # Enabled for high-performance transfers
-rdma_num_domains = 1                # Number of RDMA domains (typically 1 per NIC)
-rdma_pin_worker_cpu = 0             # CPU core to pin worker thread
-rdma_pin_uvm_cpu = 1                # CPU core to pin UVM thread
-rdma_memory_pool_mb = 40960         # RDMA memory pool size in MB
-rdma_inline_threshold = 65536       # Use RDMA for transfers > 64KB
+enable_rdma = true                       # Enabled for high-performance transfers
+rdma_num_domains = 1                     # Number of RDMA domains (typically 1 per NIC)
+rdma_pin_worker_cpu = 0                  # CPU core to pin worker thread
+rdma_pin_uvm_cpu = 1                     # CPU core to pin UVM thread
+rdma_memory_pool_mb = 40960              # RDMA staging buffer pool size in MB (for fallback path)
+rdma_page_cache_max_size_mb = 20480      # RDMA page cache table max size in MB (20GB, for persistent cached registrations)
+rdma_inline_threshold = 65536            # Use RDMA for transfers > 64KB
 
 
 # Customer service configuration.

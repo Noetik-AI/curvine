@@ -27,8 +27,10 @@ pub struct RdmaWorkerConfig {
     pub rdma_pin_worker_cpu: usize,
     /// CPU core to pin UVM thread
     pub rdma_pin_uvm_cpu: usize,
-    /// RDMA memory pool size in MB
+    /// RDMA memory pool size in MB (for staging buffers in fallback path)
     pub rdma_memory_pool_mb: usize,
+    /// RDMA page cache table max size in MB (for persistent cached registrations)
+    pub rdma_page_cache_max_size_mb: usize,
     /// Minimum transfer size to use RDMA (bytes)
     pub rdma_inline_threshold: usize,
 }
@@ -41,6 +43,7 @@ impl Default for RdmaWorkerConfig {
             rdma_pin_worker_cpu: 0,
             rdma_pin_uvm_cpu: 1,
             rdma_memory_pool_mb: 1024,
+            rdma_page_cache_max_size_mb: 20480, // 20GB default
             rdma_inline_threshold: 65536, // 64KB
         }
     }
@@ -82,6 +85,9 @@ impl RdmaWorkerConfig {
             }
             if self.rdma_memory_pool_mb == 0 {
                 return Err("rdma_memory_pool_mb must be > 0".to_string());
+            }
+            if self.rdma_page_cache_max_size_mb == 0 {
+                return Err("rdma_page_cache_max_size_mb must be > 0".to_string());
             }
             if self.rdma_inline_threshold == 0 {
                 return Err("rdma_inline_threshold must be > 0".to_string());
