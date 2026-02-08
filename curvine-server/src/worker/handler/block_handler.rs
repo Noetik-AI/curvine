@@ -87,6 +87,14 @@ impl BlockHandler {
 impl MessageHandler for BlockHandler {
     type Error = FsError;
 
+    fn is_sync(&self, msg: &Message) -> bool {
+        match self {
+            #[cfg(feature = "rdma")]
+            RdmaReader(h) => h.is_sync(msg),
+            _ => true,
+        }
+    }
+
     fn handle(&mut self, msg: &Message) -> FsResult<Message> {
         let response = match self {
             Writer(h) => h.handle(msg),
@@ -99,6 +107,19 @@ impl MessageHandler for BlockHandler {
         match response {
             Ok(v) => Ok(v),
             Err(e) => Ok(msg.error_ext(&e)),
+        }
+    }
+
+    #[cfg(feature = "rdma")]
+    fn async_handle(
+        &mut self,
+        msg: Message,
+    ) -> impl std::future::Future<Output = FsResult<Message>> + Send {
+        async move {
+            match self {
+                RdmaReader(h) => h.async_handle(msg).await,
+                _ => unreachable!("async_handle called on non-RDMA handler"),
+            }
         }
     }
 }

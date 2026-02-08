@@ -18,11 +18,10 @@
 use crate::rdma::{ClientRdmaManager, RdmaBuffer};
 use crate::block::BlockClient;
 use crate::file::FsContext;
-use bytes::BytesMut;
 use curvine_common::proto::BlockReadRequest;
 use curvine_common::state::{ExtendedBlock, WorkerAddress};
 use curvine_common::FsResult;
-use log::{info, warn};
+use log::{trace, warn};
 use orpc::common::Utils;
 use orpc::err_box;
 use orpc::sys::DataSlice;
@@ -65,7 +64,7 @@ impl BlockReaderRdma {
         // Allocate RDMA receive buffer
         let buffer: Option<RdmaBuffer> = match RdmaBuffer::allocate(rdma_manager.memory_pool(), len as usize) {
             Ok(buf) => {
-                info!(
+                trace!(
                     "Allocated RDMA buffer for block {}, size: {}",
                     block.id, len
                 );
@@ -109,8 +108,8 @@ impl BlockReaderRdma {
 
         // ZERO-COPY: Keep buffer alive! Don't copy!
         if rdma_enabled && buffer.is_some() {
-            info!(
-                "RDMA transfer completed for block {}, keeping buffer alive for zero-copy reads",
+            trace!(
+                "RDMA transfer completed for block {}, zero-copy reads enabled",
                 block.id
             );
         } else if rdma_enabled {
@@ -194,19 +193,11 @@ impl BlockReaderRdma {
                     return err_box!("No data remaining in RDMA buffer");
                 }
 
-                // Return direct slice from RDMA buffer (zero-copy!)
+                // Return direct pointer into RDMA buffer (true zero-copy, no memcpy)
                 let slice = &buffer.as_slice()[current_offset..current_offset + chunk_size];
-
-                // Wrap in BytesMut for DataSlice compatibility
-                // Note: This creates a new BytesMut but bytes::Bytes would be even better for true zero-copy
-                let chunk = DataSlice::buffer(BytesMut::from(slice));
+                let chunk = DataSlice::mem_slice(slice);
 
                 self.pos += chunk_size as i64;
-
-                info!(
-                    "Zero-copy RDMA read: returned {} bytes directly from buffer (pos={}, remaining={})",
-                    chunk_size, self.pos, self.remaining()
-                );
 
                 return Ok(chunk);
             } else {

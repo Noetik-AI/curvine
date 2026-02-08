@@ -564,14 +564,9 @@ impl RdmaReadHandler {
         Ok(Builder::success(msg).proto_header(response).build())
     }
 
+    /// Sync open — used only for non-RDMA (TCP fallback) path from handle().
     pub fn open(&mut self, msg: &Message) -> FsResult<Message> {
-        let req_id = msg.req_id();
-        info!("RDMA open() called - req_id: {}, header_len: {}", req_id, msg.header_len());
-
         let context = ReadContext::from_req(msg)?;
-        info!("RDMA open() - block_id: {}, off: {}, len: {}",
-              context.block_id, context.off, context.len);
-
         let meta = self.store.get_block(context.block_id)?;
 
         if context.off > meta.len {
@@ -583,55 +578,62 @@ impl RdmaReadHandler {
             );
         }
 
-        // Determine if we should use RDMA
+        self.open_tcp_fallback(msg, context, &meta)
+    }
+
+    /// Async open — used for RDMA transfers, avoids blocking the Tokio executor.
+    #[cfg(feature = "rdma")]
+    pub async fn async_open(&mut self, msg: &Message) -> FsResult<Message> {
+        let context = ReadContext::from_req(msg)?;
+        let meta = self.store.get_block(context.block_id)?;
+
+        if context.off > meta.len {
+            return err_box!(
+                "The length of the requested data exceeds the maximum length of the block file, \
+            request off {}, file len {}",
+                context.off,
+                meta.len
+            );
+        }
+
         let use_rdma = self.should_use_rdma(&context);
-        info!("RDMA open() - use_rdma: {} for req_id: {}", use_rdma, req_id);
 
         if use_rdma {
-            #[cfg(feature = "rdma")]
-            {
-                info!(
-                    "RDMA open() - starting RDMA transfer for block {}, len: {}, offset: {}, req_id: {}",
-                    context.block_id, context.len, context.off, req_id
-                );
-                self.metrics.rdma_enabled.set(1);
+            self.metrics.rdma_enabled.set(1);
 
-                // Try page cache approach first (superior - leverages OS cache)
-                let rdma_result = tokio::runtime::Handle::current()
-                    .block_on(self.perform_rdma_transfer_from_page_cache(msg, &context, &meta));
+            // Try page cache approach first (superior — leverages OS cache)
+            match self.perform_rdma_transfer_from_page_cache(msg, &context, &meta).await {
+                Ok(response) => {
+                    let _ = self.context.replace(context);
+                    return Ok(response);
+                }
+                Err(e) => {
+                    warn!("Page cache RDMA failed for block {}: {}, trying staging buffer", context.block_id, e);
 
-                match rdma_result {
-                    Ok(response) => {
-                        let _ = self.context.replace(context);
-                        info!("RDMA open() - SUCCESS: Page cache RDMA transfer completed, context set, req_id: {}", req_id);
-                        return Ok(response);
-                    }
-                    Err(e) => {
-                        warn!("RDMA open() - Page cache RDMA failed for req_id: {}: {}, trying staging buffer approach", req_id, e);
-
-                        // Fallback: Try staging buffer approach (direct I/O)
-                        let staging_result = tokio::runtime::Handle::current()
-                            .block_on(self.perform_rdma_transfer(msg, &context, &meta));
-
-                        match staging_result {
-                            Ok(response) => {
-                                let _ = self.context.replace(context);
-                                info!("RDMA open() - SUCCESS: Staging buffer RDMA transfer completed, context set, req_id: {}", req_id);
-                                return Ok(response);
-                            }
-                            Err(e2) => {
-                                warn!("RDMA open() - All RDMA approaches failed for req_id: {}: {}, falling back to TCP", req_id, e2);
-                                self.metrics.rdma_fallback_to_tcp.inc();
-                                // Fall through to TCP path below
-                            }
+                    // Fallback: staging buffer approach (direct I/O)
+                    match self.perform_rdma_transfer(msg, &context, &meta).await {
+                        Ok(response) => {
+                            let _ = self.context.replace(context);
+                            return Ok(response);
+                        }
+                        Err(e2) => {
+                            warn!("All RDMA approaches failed for block {}: {}, falling back to TCP", context.block_id, e2);
+                            self.metrics.rdma_fallback_to_tcp.inc();
                         }
                     }
                 }
             }
         }
 
-        // TCP fallback path: prepare file for streaming
-        info!("RDMA open() - using TCP fallback for req_id: {}, block_id: {}", req_id, context.block_id);
+        self.open_tcp_fallback(msg, context, &meta)
+    }
+
+    fn open_tcp_fallback(
+        &mut self,
+        msg: &Message,
+        context: ReadContext,
+        meta: &crate::worker::block::BlockMeta,
+    ) -> FsResult<Message> {
         let file = meta.create_reader(context.off as u64)?;
 
         let response = BlockReadResponse {
@@ -644,7 +646,6 @@ impl RdmaReadHandler {
 
         let _ = self.file.replace(file);
         let _ = self.context.replace(context);
-        info!("RDMA open() - TCP fallback setup complete, context set, req_id: {}", req_id);
 
         Ok(Builder::success(msg).proto_header(response).build())
     }
@@ -701,6 +702,18 @@ impl RdmaReadHandler {
 impl MessageHandler for RdmaReadHandler {
     type Error = FsError;
 
+    #[cfg(feature = "rdma")]
+    fn is_sync(&self, msg: &Message) -> bool {
+        // RDMA Open requires async for non-blocking RDMA transfer.
+        // Read and Complete are sync (no RDMA work, just pointer/file ops).
+        msg.request_status() != RequestStatus::Open
+    }
+
+    #[cfg(not(feature = "rdma"))]
+    fn is_sync(&self, _msg: &Message) -> bool {
+        true
+    }
+
     fn handle(&mut self, msg: &Message) -> FsResult<Message> {
         let request_status = msg.request_status();
 
@@ -709,6 +722,23 @@ impl MessageHandler for RdmaReadHandler {
             RequestStatus::Running => self.read(msg),
             RequestStatus::Complete => self.complete(msg),
             _ => err_box!("Unsupported request type for RDMA read handler"),
+        }
+    }
+
+    #[cfg(feature = "rdma")]
+    fn async_handle(
+        &mut self,
+        msg: Message,
+    ) -> impl std::future::Future<Output = FsResult<Message>> + Send {
+        async move {
+            let request_status = msg.request_status();
+
+            match request_status {
+                RequestStatus::Open => self.async_open(&msg).await,
+                RequestStatus::Running => self.read(&msg),
+                RequestStatus::Complete => self.complete(&msg),
+                _ => err_box!("Unsupported request type for RDMA read handler"),
+            }
         }
     }
 }
