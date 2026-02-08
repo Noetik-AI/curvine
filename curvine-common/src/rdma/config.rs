@@ -34,8 +34,10 @@ pub struct RdmaWorkerConfig {
     /// Minimum transfer size to use RDMA (bytes)
     pub rdma_inline_threshold: usize,
     /// Use direct polling mode (single-threaded, lower latency)
+    #[serde(default = "default_direct_polling")]
     pub rdma_direct_polling: bool,
     /// Polling interval in microseconds (only for direct polling mode)
+    #[serde(default = "default_poll_interval_us")]
     pub rdma_poll_interval_us: u64,
 }
 
@@ -81,6 +83,9 @@ impl Default for RdmaClientConfig {
         }
     }
 }
+
+fn default_direct_polling() -> bool { true }
+fn default_poll_interval_us() -> u64 { 10 }
 
 /// RDMA configuration validation
 impl RdmaWorkerConfig {
