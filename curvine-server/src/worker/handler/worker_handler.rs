@@ -44,6 +44,23 @@ pub struct WorkerHandler {
 impl MessageHandler for WorkerHandler {
     type Error = FsError;
 
+    fn is_sync(&self, msg: &Message) -> bool {
+        // Delegate to BlockHandler for read requests (RDMA Open needs async)
+        if let Some(ref handler) = self.handler {
+            return handler.is_sync(msg);
+        }
+        // No handler yet — check if the incoming Open request would create an RdmaReader.
+        // If RDMA is enabled and this is a ReadBlock Open, it will be async.
+        #[cfg(feature = "rdma")]
+        if self.rdma_manager.is_some()
+            && RpcCode::from(msg.code()) == RpcCode::ReadBlock
+            && msg.request_status() == RequestStatus::Open
+        {
+            return false;
+        }
+        true
+    }
+
     fn handle(&mut self, msg: &Message) -> FsResult<Message> {
         let code = RpcCode::from(msg.code());
         match code {
@@ -73,6 +90,29 @@ impl MessageHandler for WorkerHandler {
                 };
 
                 res
+            }
+        }
+    }
+
+    fn async_handle(
+        &mut self,
+        msg: Message,
+    ) -> impl std::future::Future<Output = FsResult<Message>> + Send {
+        async move {
+            let code = RpcCode::from(msg.code());
+            match code {
+                RpcCode::SubmitTask => self.task_submit(&msg),
+                RpcCode::CancelJob => self.cancel_job(&msg),
+                RpcCode::SubmitBlockReplicationJob => self.replication_handler.handle(&msg),
+                _ => {
+                    let h = self.get_handler(&msg)?;
+                    let res = h.async_handle(msg).await;
+
+                    // Release handler back to pool when request completes
+                    // Note: for async_handle, the msg was moved, so we check the result
+                    // The Open request doesn't release — only Complete/Cancel does
+                    res
+                }
             }
         }
     }
