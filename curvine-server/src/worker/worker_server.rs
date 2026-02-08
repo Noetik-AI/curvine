@@ -278,30 +278,32 @@ impl Worker {
                         poll_interval_us
                     );
 
-                    // Spawn dedicated RDMA polling task
-                    let rt = self.rpc_server.clone_rt();
-                    rt.spawn(async move {
-                        let mut interval = tokio::time::interval(
-                            std::time::Duration::from_micros(poll_interval_us)
-                        );
-
-                        loop {
-                            interval.tick().await;
-
-                            match rdma_mgr.poll_completions() {
-                                Ok(count) if count > 0 => {
-                                    // Completions processed
-                                }
-                                Ok(_) => {
-                                    // No completions, continue polling
-                                }
-                                Err(e) => {
-                                    log::error!("RDMA polling error: {}", e);
-                                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    // Spawn dedicated OS thread for RDMA polling.
+                    // IMPORTANT: Must be a std::thread, NOT a Tokio task, because
+                    // completion callbacks use blocking_send() which panics inside
+                    // an async Tokio context.
+                    std::thread::Builder::new()
+                        .name("rdma-poll".to_string())
+                        .spawn(move || {
+                            let poll_interval = std::time::Duration::from_micros(poll_interval_us);
+                            loop {
+                                match rdma_mgr.poll_completions() {
+                                    Ok(count) if count > 0 => {
+                                        // Completions processed, poll again immediately
+                                        continue;
+                                    }
+                                    Ok(_) => {
+                                        // No completions, sleep before next poll
+                                        std::thread::sleep(poll_interval);
+                                    }
+                                    Err(e) => {
+                                        log::error!("RDMA polling error: {}", e);
+                                        std::thread::sleep(std::time::Duration::from_millis(1));
+                                    }
                                 }
                             }
-                        }
-                    });
+                        })
+                        .expect("Failed to spawn RDMA polling thread");
 
                     info!("RDMA direct polling task started successfully");
                 }
