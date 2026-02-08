@@ -21,7 +21,8 @@ use crate::file::FsContext;
 use curvine_common::proto::BlockReadRequest;
 use curvine_common::state::{ExtendedBlock, WorkerAddress};
 use curvine_common::FsResult;
-use log::{trace, warn};
+use log::{info, trace, warn};
+use orpc::common::ByteUnit;
 use orpc::common::Utils;
 use orpc::err_box;
 use orpc::sys::DataSlice;
@@ -106,14 +107,21 @@ impl BlockReaderRdma {
         let response = client.open_block_with_request(req_id, seq_id, request).await?;
         let rdma_enabled = response.rdma_transfer.unwrap_or(false);
 
-        // ZERO-COPY: Keep buffer alive! Don't copy!
         if rdma_enabled && buffer.is_some() {
-            trace!(
-                "RDMA transfer completed for block {}, zero-copy reads enabled",
-                block.id
+            info!(
+                "RDMA read: block_id={}, size={}, worker={} (zero-copy)",
+                block.id, ByteUnit::byte_to_string(len as u64), worker_address
             );
-        } else if rdma_enabled {
-            warn!("RDMA enabled but no buffer allocated, using TCP fallback");
+        } else if buffer.is_some() {
+            info!(
+                "TCP read: block_id={}, size={}, worker={} (worker declined RDMA)",
+                block.id, ByteUnit::byte_to_string(len as u64), worker_address
+            );
+        } else {
+            info!(
+                "TCP read: block_id={}, size={}, worker={} (RDMA buffer alloc failed)",
+                block.id, ByteUnit::byte_to_string(len as u64), worker_address
+            );
         }
 
         let reader = Self {
