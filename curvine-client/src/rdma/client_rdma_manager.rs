@@ -148,4 +148,10 @@ impl RdmaBuffer {
     pub fn size(&self) -> usize {
         self.allocation.size()
     }
+
+    /// Clone the underlying RDMA allocation handle (Arc clone, cheap).
+    /// Keeps the RDMA buffer alive as long as any clone exists.
+    pub fn clone_allocation(&self) -> curvine_common::rdma::RdmaAllocation {
+        self.allocation.clone()
+    }
 }

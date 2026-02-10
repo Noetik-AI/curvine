@@ -21,12 +21,29 @@ use crate::file::FsContext;
 use curvine_common::proto::BlockReadRequest;
 use curvine_common::state::{ExtendedBlock, WorkerAddress};
 use curvine_common::FsResult;
+use bytes::Bytes;
+use curvine_common::rdma::RdmaAllocation;
 use log::{info, trace, warn};
 use orpc::common::ByteUnit;
 use orpc::common::Utils;
 use orpc::err_box;
 use orpc::sys::DataSlice;
 use std::sync::Arc;
+
+/// Zero-copy slice into an RDMA buffer. Keeps the underlying RDMA allocation
+/// alive via Arc reference counting. Implements `AsRef<[u8]>` so it can be
+/// used with `Bytes::from_owner()`.
+struct OwnedRdmaSlice {
+    alloc: RdmaAllocation,
+    offset: usize,
+    len: usize,
+}
+
+impl AsRef<[u8]> for OwnedRdmaSlice {
+    fn as_ref(&self) -> &[u8] {
+        &self.alloc.as_slice()[self.offset..self.offset + self.len]
+    }
+}
 
 /// RDMA-enabled block reader that uses zero-copy transfers.
 /// Keeps RDMA buffer alive and returns direct slices without copying.
@@ -201,9 +218,15 @@ impl BlockReaderRdma {
                     return err_box!("No data remaining in RDMA buffer");
                 }
 
-                // Return direct pointer into RDMA buffer (true zero-copy, no memcpy)
-                let slice = &buffer.as_slice()[current_offset..current_offset + chunk_size];
-                let chunk = DataSlice::mem_slice(slice);
+                // Return owned slice into RDMA buffer (true zero-copy, no memcpy).
+                // OwnedRdmaSlice keeps the Arc<RdmaAllocation> alive; Bytes::from_owner
+                // stores it so the RDMA buffer won't be freed until all references drop.
+                let owned = OwnedRdmaSlice {
+                    alloc: buffer.clone_allocation(),
+                    offset: current_offset,
+                    len: chunk_size,
+                };
+                let chunk = DataSlice::Bytes(Bytes::from_owner(owned));
 
                 self.pos += chunk_size as i64;
 

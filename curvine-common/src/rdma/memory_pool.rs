@@ -30,8 +30,8 @@ struct FreeBlock {
     size: usize,
 }
 
-/// Allocation from RDMA memory pool
-pub struct RdmaAllocation {
+/// Inner allocation from RDMA memory pool (private, ref-counted via Arc)
+struct RdmaAllocationInner {
     /// Pointer to allocated memory
     ptr: *mut u8,
     /// Size of allocation
@@ -42,46 +42,64 @@ pub struct RdmaAllocation {
     pool: Arc<RdmaMemoryPoolInner>,
 }
 
-impl RdmaAllocation {
-    pub fn ptr(&self) -> u64 {
-        self.ptr as u64
-    }
-
-    pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.size) }
-    }
-
-    pub fn as_slice(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.ptr, self.size) }
-    }
-
-    pub fn size(&self) -> usize {
-        self.size
-    }
-
-    /// Get the offset of this allocation within the pool
-    pub fn offset(&self) -> usize {
-        self.offset
-    }
-
-    #[cfg(feature = "rdma")]
-    pub fn handle(&self) -> MemoryRegionHandle {
-        self.pool.handle
-    }
-}
-
-impl Drop for RdmaAllocation {
+impl Drop for RdmaAllocationInner {
     fn drop(&mut self) {
         self.pool.deallocate(self.offset, self.size);
     }
 }
 
-// RdmaAllocation is Send/Sync because:
+// RdmaAllocationInner is Send/Sync because:
 // 1. The raw pointer is managed by Arc<RdmaMemoryPoolInner> which is Send/Sync
 // 2. The memory is RDMA-registered and stable (won't be freed until Arc drops)
 // 3. The pointer is valid across threads as long as the pool is alive
-unsafe impl Send for RdmaAllocation {}
-unsafe impl Sync for RdmaAllocation {}
+unsafe impl Send for RdmaAllocationInner {}
+unsafe impl Sync for RdmaAllocationInner {}
+
+/// Allocation from RDMA memory pool. Cheaply cloneable (Arc-based).
+/// Cloning keeps the underlying RDMA buffer alive via reference counting.
+#[derive(Clone)]
+pub struct RdmaAllocation {
+    inner: Arc<RdmaAllocationInner>,
+}
+
+impl RdmaAllocation {
+    fn new(ptr: *mut u8, size: usize, offset: usize, pool: Arc<RdmaMemoryPoolInner>) -> Self {
+        Self {
+            inner: Arc::new(RdmaAllocationInner { ptr, size, offset, pool }),
+        }
+    }
+
+    pub fn ptr(&self) -> u64 {
+        self.inner.ptr as u64
+    }
+
+    /// Mutable access to the allocation buffer. Only valid before any clones
+    /// are made — panics if the Arc has been cloned (i.e. during initial RDMA
+    /// buffer setup before handing out shared references).
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        let inner = Arc::get_mut(&mut self.inner)
+            .expect("as_mut_slice called on a shared RdmaAllocation (Arc refcount > 1)");
+        unsafe { std::slice::from_raw_parts_mut(inner.ptr, inner.size) }
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.inner.ptr, self.inner.size) }
+    }
+
+    pub fn size(&self) -> usize {
+        self.inner.size
+    }
+
+    /// Get the offset of this allocation within the pool
+    pub fn offset(&self) -> usize {
+        self.inner.offset
+    }
+
+    #[cfg(feature = "rdma")]
+    pub fn handle(&self) -> MemoryRegionHandle {
+        self.inner.pool.handle
+    }
+}
 
 /// Inner state of RDMA memory pool
 struct RdmaMemoryPoolInner {
@@ -237,12 +255,7 @@ impl RdmaMemoryPool {
         if let Some((offset, ptr)) = self.inner.try_allocate_from_free_list(aligned_size) {
             self.inner.alloc_count.fetch_add(1, Ordering::Relaxed);
 
-            return Ok(RdmaAllocation {
-                ptr,
-                size,
-                offset,
-                pool: self.inner.clone(),
-            });
+            return Ok(RdmaAllocation::new(ptr, size, offset, self.inner.clone()));
         }
 
         // No suitable free block found, bump allocate from unallocated space
@@ -282,12 +295,7 @@ impl RdmaMemoryPool {
 
         let ptr = unsafe { self.inner.base_ptr.add(offset) };
 
-        Ok(RdmaAllocation {
-            ptr,
-            size,
-            offset,
-            pool: self.inner.clone(),
-        })
+        Ok(RdmaAllocation::new(ptr, size, offset, self.inner.clone()))
     }
 
     /// Get the memory region descriptor for this pool
