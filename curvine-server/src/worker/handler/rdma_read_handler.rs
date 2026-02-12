@@ -652,7 +652,7 @@ impl RdmaReadHandler {
 
     pub fn read(&mut self, msg: &Message) -> FsResult<Message> {
         let req_id = msg.req_id();
-        info!("RDMA read() called - req_id: {}", req_id);
+        debug!("RDMA read() called - req_id: {}", req_id);
 
         if self.file.is_none() || self.context.is_none() {
             let err_msg = format!(
