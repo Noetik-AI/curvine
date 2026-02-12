@@ -60,12 +60,12 @@ impl TransferEngineManager {
 
         let engine = Arc::new(engine);
 
-        // Get domain addresses for capability advertisement
-        let domain_addresses = vec![engine.main_address().into()];
+        // Get actual number of domains from engine (may differ from requested)
+        let actual_num_domains = engine.num_domains();
 
         info!(
             "TransferEngine created successfully in DIRECT POLLING mode with {} domains",
-            engine.num_domains()
+            actual_num_domains
         );
 
         // Create and register RDMA memory pool
@@ -82,6 +82,18 @@ impl TransferEngineManager {
             )
             .map_err(|e| format!("Failed to register RDMA memory: {}", e))?;
 
+        // Extract all domain addresses from fabric descriptor (one per domain/NIC)
+        let domain_addresses: Vec<DomainAddress> = fabric_descriptor
+            .addr_rkey_list
+            .iter()
+            .map(|(addr, _rkey)| addr.clone().into())
+            .collect();
+
+        info!(
+            "RDMA domains: requested={}, actual={}, advertised_addresses={}",
+            num_domains, actual_num_domains, domain_addresses.len()
+        );
+
         let descriptor: MemoryRegionDescriptor = fabric_descriptor.into();
         let memory_pool = RdmaMemoryPool::new(buffer, descriptor, handle);
 
@@ -94,7 +106,7 @@ impl TransferEngineManager {
             engine,
             memory_pool,
             domain_addresses,
-            num_domains,
+            num_domains: actual_num_domains,
             poll_handle: Some(Mutex::new(poll_handle)),
             direct_polling_enabled: true,
         })
@@ -122,12 +134,12 @@ impl TransferEngineManager {
 
         let engine = Arc::new(engine);
 
-        // Get domain addresses for capability advertisement
-        let domain_addresses = vec![engine.main_address().into()];
+        // Get actual number of domains from engine (may differ from requested)
+        let actual_num_domains = engine.num_domains();
 
         info!(
             "TransferEngine created successfully with {} domains",
-            engine.num_domains()
+            actual_num_domains
         );
 
         // Create and register RDMA memory pool
@@ -144,6 +156,18 @@ impl TransferEngineManager {
             )
             .map_err(|e| format!("Failed to register RDMA memory: {}", e))?;
 
+        // Extract all domain addresses from fabric descriptor (one per domain/NIC)
+        let domain_addresses: Vec<DomainAddress> = fabric_descriptor
+            .addr_rkey_list
+            .iter()
+            .map(|(addr, _rkey)| addr.clone().into())
+            .collect();
+
+        info!(
+            "RDMA domains: requested={}, actual={}, advertised_addresses={}",
+            num_domains, actual_num_domains, domain_addresses.len()
+        );
+
         let descriptor: MemoryRegionDescriptor = fabric_descriptor.into();
         let memory_pool = RdmaMemoryPool::new(buffer, descriptor, handle);
 
@@ -156,7 +180,7 @@ impl TransferEngineManager {
             engine,
             memory_pool,
             domain_addresses,
-            num_domains,
+            num_domains: actual_num_domains,
             poll_handle: None,
             direct_polling_enabled: false,
         })
@@ -219,7 +243,8 @@ impl TransferEngineManager {
             dst_mr: dst_descriptor.into(),
             dst_offset,
             domain: DomainGroupRouting::RoundRobinSharded {
-                num_shards: NonZeroU8::new(1).unwrap(),
+                num_shards: NonZeroU8::new(self.num_domains as u8)
+                    .expect("num_domains must be > 0"),
             },
         });
 
