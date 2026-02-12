@@ -26,7 +26,7 @@ use crate::worker::{Worker, WorkerMetrics};
 use curvine_common::error::FsError;
 use curvine_common::proto::BlockReadResponse;
 use curvine_common::FsResult;
-use log::{info, warn};
+use log::{debug, info, warn};
 use orpc::handler::MessageHandler;
 use orpc::io::LocalFile;
 use orpc::message::{Builder, Message, RequestStatus};
