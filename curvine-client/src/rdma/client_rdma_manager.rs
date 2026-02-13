@@ -40,6 +40,10 @@ impl ClientRdmaManager {
         );
 
         // Create TransferEngine for host memory
+        info!(
+            "[RDMA] Creating client TransferEngine: requested_domains={}, pin_worker={}, pin_uvm={}",
+            num_domains, pin_worker_cpu, pin_uvm_cpu
+        );
         let engine = TransferEngine::new_host_only(
             num_domains,
             pin_worker_cpu as u16,
@@ -48,18 +52,24 @@ impl ClientRdmaManager {
         .map_err(|e| format!("Failed to create client TransferEngine: {}", e))?;
 
         let engine = Arc::new(engine);
+        let actual_domains = engine.num_domains();
 
         info!(
-            "Client TransferEngine created with {} domains",
-            engine.num_domains()
+            "[RDMA] Client TransferEngine created: requested_domains={}, actual_domains={}",
+            num_domains, actual_domains
         );
 
         // Create and register RDMA receive buffer pool
         let pool_size_bytes = memory_pool_size_mb * 1024 * 1024;
+        info!(
+            "[RDMA] Allocating client memory pool: {}MB ({} bytes)",
+            memory_pool_size_mb, pool_size_bytes
+        );
         let mut buffer = vec![0u8; pool_size_bytes];
         let buffer_ptr = NonNull::new(buffer.as_mut_ptr())
             .ok_or_else(|| "Null buffer pointer".to_string())?;
 
+        info!("[RDMA] Registering client memory with RDMA NIC...");
         let (handle, fabric_descriptor) = engine
             .register_memory_allow_remote(
                 buffer_ptr.cast(),
@@ -69,12 +79,12 @@ impl ClientRdmaManager {
             .map_err(|e| format!("Failed to register client RDMA memory: {}", e))?;
 
         let descriptor: MemoryRegionDescriptor = fabric_descriptor.into();
-        let memory_pool = RdmaMemoryPool::new(buffer, descriptor, handle);
-
         info!(
-            "Client RDMA memory pool registered: {}MB",
-            pool_size_bytes / (1024 * 1024)
+            "[RDMA] Client memory registered: {}MB, addr_rkey_pairs={}",
+            pool_size_bytes / (1024 * 1024),
+            descriptor.addr_rkey_list.len()
         );
+        let memory_pool = RdmaMemoryPool::new(buffer, descriptor, handle);
 
         Ok(ClientRdmaManager {
             engine,

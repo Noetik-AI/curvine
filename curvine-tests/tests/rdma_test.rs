@@ -504,6 +504,7 @@ mod rdma_disabled_tests {
             ip_addr: "10.0.0.1".to_string(),
             rpc_port: 9001,
             web_port: 9002,
+            rdma_capability: None,
         };
 
         // supports_rdma() should always return false

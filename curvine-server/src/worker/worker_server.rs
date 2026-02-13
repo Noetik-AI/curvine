@@ -210,6 +210,8 @@ impl Worker {
 
         #[cfg(feature = "rdma")]
         let rdma_capability = service.rdma_manager.as_ref().map(|m| m.get_capability());
+        #[cfg(not(feature = "rdma"))]
+        let rdma_capability: Option<curvine_common::rdma::RdmaCapability> = None;
 
         let addr = WorkerAddress {
             worker_id,
@@ -217,7 +219,6 @@ impl Worker {
             ip_addr,
             rpc_port: net_addr.port as u32,
             web_port: conf.worker.web_port as u32,
-            #[cfg(feature = "rdma")]
             rdma_capability,
         };
 

@@ -23,7 +23,7 @@ use curvine_common::state::{ExtendedBlock, WorkerAddress};
 use curvine_common::FsResult;
 use bytes::Bytes;
 use curvine_common::rdma::RdmaAllocation;
-use log::{info, trace, warn};
+use log::{info, warn};
 use orpc::common::ByteUnit;
 use orpc::common::Utils;
 use orpc::err_box;
@@ -80,18 +80,22 @@ impl BlockReaderRdma {
         let seq_id = 0;
 
         // Allocate RDMA receive buffer
+        let (pool_offset, pool_allocs, pool_deallocs, pool_free, _) = rdma_manager.pool_stats();
         let buffer: Option<RdmaBuffer> = match RdmaBuffer::allocate(rdma_manager.memory_pool(), len as usize) {
             Ok(buf) => {
-                trace!(
-                    "Allocated RDMA buffer for block {}, size: {}",
-                    block.id, len
+                info!(
+                    "[RDMA] buffer allocated: block={}, size={}, buf_ptr=0x{:x}, pool(offset={}, allocs={}, deallocs={}, free={})",
+                    block.id, ByteUnit::byte_to_string(len as u64),
+                    buf.descriptor(rdma_manager.memory_pool()).ptr,
+                    pool_offset, pool_allocs, pool_deallocs, pool_free
                 );
                 Some(buf)
             }
             Err(e) => {
                 warn!(
-                    "Failed to allocate RDMA buffer (size {}), falling back to TCP: {}",
-                    len, e
+                    "[RDMA] buffer alloc FAILED: block={}, size={}, pool(offset={}, allocs={}, deallocs={}, free={}): {}",
+                    block.id, ByteUnit::byte_to_string(len as u64),
+                    pool_offset, pool_allocs, pool_deallocs, pool_free, e
                 );
                 None
             }
@@ -100,8 +104,13 @@ impl BlockReaderRdma {
         // Get memory region descriptor if we have a buffer
         let (rdma_target, rdma_target_offset) = if let Some(ref buf) = buffer {
             let descriptor = buf.descriptor(rdma_manager.memory_pool());
+            info!(
+                "[RDMA] target descriptor: block={}, ptr=0x{:x}, addr_rkey_pairs={}",
+                block.id, descriptor.ptr, descriptor.addr_rkey_list.len()
+            );
             (Some(descriptor.into()), Some(0u64))
         } else {
+            warn!("[RDMA] no buffer → rdma_target=None for block={}, worker will see 'client did not provide RDMA target'", block.id);
             (None, Some(0u64))
         };
 

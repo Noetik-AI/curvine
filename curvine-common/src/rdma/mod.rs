@@ -16,9 +16,11 @@
 
 pub mod config;
 pub mod conversions;
+#[cfg(feature = "rdma")]
 pub mod memory_pool;
 pub mod types;
 
 pub use config::*;
+#[cfg(feature = "rdma")]
 pub use memory_pool::*;
 pub use types::*;

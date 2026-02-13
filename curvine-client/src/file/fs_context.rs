@@ -99,6 +99,13 @@ impl FsContext {
 
         #[cfg(feature = "rdma")]
         let rdma_manager = if conf.client.rdma.enable_rdma {
+            log::info!(
+                "Client RDMA init: domains={}, pool={}MB, pin_worker_cpu={}, pin_uvm_cpu={}",
+                conf.client.rdma.rdma_num_domains,
+                conf.client.rdma.rdma_memory_pool_mb,
+                conf.client.rdma.rdma_pin_worker_cpu,
+                conf.client.rdma.rdma_pin_uvm_cpu,
+            );
             match crate::rdma::ClientRdmaManager::new(
                 conf.client.rdma.rdma_num_domains,
                 conf.client.rdma.rdma_pin_worker_cpu,
@@ -106,15 +113,26 @@ impl FsContext {
                 conf.client.rdma.rdma_memory_pool_mb,
             ) {
                 Ok(manager) => {
-                    log::info!("Client RDMA enabled");
+                    let (offset, allocs, deallocs, free_blocks, _) = manager.pool_stats();
+                    log::info!(
+                        "Client RDMA initialized successfully: pool={}MB, offset={}, allocs={}, deallocs={}, free_blocks={}",
+                        conf.client.rdma.rdma_memory_pool_mb, offset, allocs, deallocs, free_blocks
+                    );
                     Some(Arc::new(manager))
                 }
                 Err(e) => {
-                    warn!("Failed to initialize client RDMA (fallback to TCP): {}", e);
+                    log::error!(
+                        "Client RDMA init FAILED (all reads will use TCP): {}. \
+                         Config: rdma_num_domains={}, rdma_memory_pool_mb={}",
+                        e,
+                        conf.client.rdma.rdma_num_domains,
+                        conf.client.rdma.rdma_memory_pool_mb,
+                    );
                     None
                 }
             }
         } else {
+            log::info!("Client RDMA disabled by config (enable_rdma=false)");
             None
         };
 

@@ -22,6 +22,8 @@ use crate::block::BlockReaderRdma;
 use crate::file::FsContext;
 use curvine_common::state::{ClientAddress, ExtendedBlock, LocatedBlock, WorkerAddress};
 use curvine_common::FsResult;
+#[cfg(feature = "rdma")]
+use log::info;
 use log::warn;
 use orpc::common::Utils;
 use orpc::error::ErrorExt;
@@ -194,28 +196,38 @@ impl BlockReader {
     fn should_use_rdma(fs_context: &FsContext, worker: &WorkerAddress) -> bool {
         // Check if client has RDMA enabled
         if !fs_context.has_rdma() {
+            warn!("[RDMA] client has_rdma=false (rdma_manager not initialized), using TCP for worker {}", worker);
             return false;
         }
 
         // Check if worker advertises RDMA capability
-        if let Some(rdma_cap) = &worker.rdma_capability {
-            if !rdma_cap.enabled {
-                return false;
+        match &worker.rdma_capability {
+            Some(rdma_cap) => {
+                if !rdma_cap.enabled {
+                    info!("[RDMA] worker {} rdma_capability.enabled=false, using TCP", worker);
+                    return false;
+                }
+                if rdma_cap.domain_addresses.is_empty() {
+                    warn!(
+                        "[RDMA] worker {} rdma_capability has 0 domain_addresses, using TCP",
+                        worker
+                    );
+                    return false;
+                }
+                info!(
+                    "[RDMA] negotiation OK: client=ready, worker={}, domains={}",
+                    worker, rdma_cap.domain_addresses.len()
+                );
+                true
             }
-
-            // Verify worker has at least one domain address
-            if rdma_cap.domain_addresses.is_empty() {
+            None => {
                 warn!(
-                    "Worker {} advertises RDMA but has no domain addresses",
+                    "[RDMA] worker {} has rdma_capability=None (master may not forward RDMA info), using TCP",
                     worker
                 );
-                return false;
+                false
             }
-
-            return true;
         }
-
-        false
     }
 
     async fn get_reader(
@@ -260,14 +272,22 @@ impl BlockReader {
                                 )
                                 .await
                                 {
-                                    Ok(reader) => return Ok(Rdma(reader)),
+                                    Ok(reader) => {
+                                        info!(
+                                            "[RDMA] created BlockReaderRdma for block={}, worker={}",
+                                            block.id, loc
+                                        );
+                                        return Ok(Rdma(reader));
+                                    }
                                     Err(e) => {
                                         warn!(
-                                            "RDMA reader creation failed for {}, falling back to TCP: {}",
-                                            loc, e
+                                            "[RDMA] BlockReaderRdma creation FAILED for block={}, worker={}, falling back to TCP: {}",
+                                            block.id, loc, e
                                         );
                                     }
                                 }
+                            } else {
+                                warn!("[RDMA] should_use_rdma=true but rdma_manager() returned None");
                             }
                         }
                     }

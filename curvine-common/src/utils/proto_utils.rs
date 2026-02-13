@@ -61,10 +61,7 @@ impl ProtoUtils {
             ip_addr: addr.ip_addr.to_owned(),
             rpc_port: addr.rpc_port,
             web_port: addr.web_port,
-            #[cfg(feature = "rdma")]
             rdma_capability: addr.rdma_capability.clone().map(Into::into),
-            #[cfg(not(feature = "rdma"))]
-            rdma_capability: None,
         }
     }
 
@@ -75,7 +72,6 @@ impl ProtoUtils {
             ip_addr: addr.ip_addr.to_owned(),
             rpc_port: addr.rpc_port,
             web_port: addr.web_port,
-            #[cfg(feature = "rdma")]
             rdma_capability: addr.rdma_capability.clone().map(Into::into),
         }
     }
