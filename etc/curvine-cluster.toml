@@ -52,6 +52,9 @@ rdma_poll_interval_us = 10               # Polling interval in microseconds (def
 
 # Customer service configuration.
 [client]
+master_addrs = [
+    { hostname = "ray-cluster-hyperpod-head-svc.training.svc.cluster.local", port = 8995 }
+]
 
 # RDMA configuration for client
 [client.rdma]
