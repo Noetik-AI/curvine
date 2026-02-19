@@ -32,3 +32,19 @@ pub use self::block_handler::BlockHandler;
 
 mod router_handler;
 pub use self::router_handler::WorkerRouterHandler;
+
+#[cfg(feature = "rdma")]
+mod rdma_read_handler;
+#[cfg(feature = "rdma")]
+pub use self::rdma_read_handler::RdmaReadHandler;
+
+#[cfg(feature = "rdma")]
+mod rdma_page_cache;
+
+#[cfg(feature = "rdma")]
+mod rdma_page_cache_table;
+#[cfg(feature = "rdma")]
+pub use self::rdma_page_cache_table::{PageCacheTable, PageCacheKey, PageCacheStats};
+
+mod handler_pool;
+pub use self::handler_pool::{HandlerPool, HandlerPoolStats};

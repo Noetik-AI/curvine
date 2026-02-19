@@ -51,6 +51,10 @@ pub struct BenchArgs {
     // Whether to calculate checksum
     #[arg(long, action = clap::ArgAction::Set, default_value = "true")]
     pub checksum: bool,
+
+    // Number of warmup rounds before timed measurement (warms up connections, RDMA, page cache)
+    #[arg(long, default_value = "1")]
+    pub warmup: usize,
 }
 
 impl BenchArgs {

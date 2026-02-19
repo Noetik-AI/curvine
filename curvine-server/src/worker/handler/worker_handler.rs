@@ -13,9 +13,11 @@
 // limitations under the License.
 
 use crate::worker::block::BlockStore;
-use crate::worker::handler::BlockHandler;
+use crate::worker::handler::{BlockHandler, HandlerPool};
 use crate::worker::replication::worker_replication_handler::WorkerReplicationHandler;
 use crate::worker::task::TaskManager;
+#[cfg(feature = "rdma")]
+use crate::worker::rdma::TransferEngineManager;
 use curvine_common::error::FsError;
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::*;
@@ -31,13 +33,33 @@ use std::sync::Arc;
 pub struct WorkerHandler {
     pub store: BlockStore,
     pub handler: Option<BlockHandler>,
+    pub handler_pool: Arc<HandlerPool>,
     pub task_manager: Arc<TaskManager>,
     pub rt: Arc<Runtime>,
     pub replication_handler: WorkerReplicationHandler,
+    #[cfg(feature = "rdma")]
+    pub rdma_manager: Option<Arc<TransferEngineManager>>,
 }
 
 impl MessageHandler for WorkerHandler {
     type Error = FsError;
+
+    fn is_sync(&self, msg: &Message) -> bool {
+        // Delegate to BlockHandler for read requests (RDMA Open needs async)
+        if let Some(ref handler) = self.handler {
+            return handler.is_sync(msg);
+        }
+        // No handler yet — check if the incoming Open request would create an RdmaReader.
+        // If RDMA is enabled and this is a ReadBlock Open, it will be async.
+        #[cfg(feature = "rdma")]
+        if self.rdma_manager.is_some()
+            && RpcCode::from(msg.code()) == RpcCode::ReadBlock
+            && msg.request_status() == RequestStatus::Open
+        {
+            return false;
+        }
+        true
+    }
 
     fn handle(&mut self, msg: &Message) -> FsResult<Message> {
         let code = RpcCode::from(msg.code());
@@ -52,14 +74,45 @@ impl MessageHandler for WorkerHandler {
                 let h = self.get_handler(msg)?;
                 let res = h.handle(msg);
 
+                // Release handler back to pool when request completes
                 if matches!(
                     msg.request_status(),
                     RequestStatus::Cancel | RequestStatus::Complete
                 ) {
-                    let _ = self.handler.take();
+                    if let Some(handler) = self.handler.take() {
+                        log::debug!(
+                            "Releasing handler back to pool for req_id: {}, status: {:?}",
+                            msg.req_id(),
+                            msg.request_status()
+                        );
+                        self.handler_pool.release(handler);
+                    }
                 };
 
                 res
+            }
+        }
+    }
+
+    fn async_handle(
+        &mut self,
+        msg: Message,
+    ) -> impl std::future::Future<Output = FsResult<Message>> + Send {
+        async move {
+            let code = RpcCode::from(msg.code());
+            match code {
+                RpcCode::SubmitTask => self.task_submit(&msg),
+                RpcCode::CancelJob => self.cancel_job(&msg),
+                RpcCode::SubmitBlockReplicationJob => self.replication_handler.handle(&msg),
+                _ => {
+                    let h = self.get_handler(&msg)?;
+                    let res = h.async_handle(msg).await;
+
+                    // Release handler back to pool when request completes
+                    // Note: for async_handle, the msg was moved, so we check the result
+                    // The Open request doesn't release — only Complete/Cancel does
+                    res
+                }
             }
         }
     }
@@ -68,14 +121,41 @@ impl MessageHandler for WorkerHandler {
 impl WorkerHandler {
     fn get_handler(&mut self, msg: &Message) -> FsResult<&mut BlockHandler> {
         let code = RpcCode::from(msg.code());
+        let status = msg.request_status();
 
+        // Determine if we need a new handler:
+        // 1. Always create if no handler exists
+        // 2. For Open requests: create new if type doesn't match (to start fresh)
+        // 3. For Running/Complete/Cancel: ONLY create if type doesn't match
+        //    (otherwise REUSE to preserve state like context from open())
         let need_new_handler = self.handler.is_none()
-            || !matches!(msg.request_status(), RequestStatus::Running)
             || !Self::handler_matches_code(&self.handler, code);
 
         if need_new_handler {
-            let handler = BlockHandler::new(code, self.store.clone())?;
+            log::debug!(
+                "Acquiring handler from pool for req_id: {}, status: {:?}, code: {:?}",
+                msg.req_id(),
+                status,
+                code
+            );
+
+            // Try to acquire from pool first
+            let handler = if let Some(pooled) = self.handler_pool.acquire(code) {
+                log::debug!("Acquired handler from pool for {:?}", code);
+                pooled
+            } else {
+                // Pool exhausted, create on-demand
+                log::warn!("Handler pool exhausted, creating on-demand for {:?}", code);
+                self.handler_pool.create_handler(code)?
+            };
+
             let _ = self.handler.replace(handler);
+        } else {
+            log::debug!(
+                "Reusing existing handler for req_id: {}, status: {:?}",
+                msg.req_id(),
+                status
+            );
         }
 
         match self.handler.as_mut() {
@@ -86,15 +166,31 @@ impl WorkerHandler {
 
     // Check if the current handler type matches the request code
     fn handler_matches_code(handler: &Option<BlockHandler>, code: RpcCode) -> bool {
-        matches!(
-            (handler, code),
-            (Some(BlockHandler::Writer(_)), RpcCode::WriteBlock)
-                | (Some(BlockHandler::Reader(_)), RpcCode::ReadBlock)
-                | (
-                    Some(BlockHandler::BatchWriter(_)),
-                    RpcCode::WriteBlocksBatch
-                )
-        )
+        #[cfg(feature = "rdma")]
+        {
+            matches!(
+                (handler, code),
+                (Some(BlockHandler::Writer(_)), RpcCode::WriteBlock)
+                    | (Some(BlockHandler::Reader(_)), RpcCode::ReadBlock)
+                    | (Some(BlockHandler::RdmaReader(_)), RpcCode::ReadBlock)
+                    | (
+                        Some(BlockHandler::BatchWriter(_)),
+                        RpcCode::WriteBlocksBatch
+                    )
+            )
+        }
+        #[cfg(not(feature = "rdma"))]
+        {
+            matches!(
+                (handler, code),
+                (Some(BlockHandler::Writer(_)), RpcCode::WriteBlock)
+                    | (Some(BlockHandler::Reader(_)), RpcCode::ReadBlock)
+                    | (
+                        Some(BlockHandler::BatchWriter(_)),
+                        RpcCode::WriteBlocksBatch
+                    )
+            )
+        }
     }
 
     pub fn task_submit(&self, msg: &Message) -> FsResult<Message> {

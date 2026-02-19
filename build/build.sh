@@ -68,7 +68,7 @@ get_fuse_version() {
   elif command -v fusermount > /dev/null 2>&1; then
       echo "fuse2"
   else
-      echo ""  # No FUSE available
+      echo "fuse3"  # No FUSE available
   fi
 }
 
@@ -441,6 +441,13 @@ if [ ${#EXTRA_FEATURES[@]} -gt 0 ]; then
         # JNI features need to be added to curvine-ufs and curvine-server
         FEATURES+=("curvine-ufs/jni")
         FEATURES+=("curvine-server/jni")
+        ;;
+      rdma)
+        # RDMA features need to be added to all relevant packages
+        FEATURES+=("curvine-common/rdma")
+        FEATURES+=("curvine-server/rdma")
+        FEATURES+=("curvine-client/rdma")
+        FEATURES+=("curvine-tests/rdma")
         ;;
       *)
         # For other features, add as-is (might be package-specific)

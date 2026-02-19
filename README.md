@@ -58,7 +58,7 @@ For more detailed information, please refer to:
 - **Multi-tir Cache**: Supports multi-tir cache strategies for memory, SSD, and HDD.
 - **POSIX Semantic Support**: Curvine delivers comprehensive POSIX semantic compatibility, implementing a high-performance FUSE layer to facilitate the manipulation of distributed cached data as if it were local disk storage.
 - **Compatibility with S3 and HDFS Protocols**: The system supports both S3 and HDFS read/write interfaces, facilitating seamless integration with artificial intelligence and big data technology ecosystems.
-- **High Performance**: Curvine employs "zero-copy" techniques multiple times throughout its data read/write pipeline and leverages asynchronous operations. Additionally, its core engine is built with Rust, ensuring optimal performance is achieved.
+- **High Performance**: Curvine employs "zero-copy" techniques multiple times throughout its data read/write pipeline and leverages asynchronous operations. Additionally, its core engine is built with Rust, ensuring optimal performance is achieved. Optional RDMA support provides 5-10x latency improvement for large block transfers.
 - **Raft Consensus**: Uses the Raft algorithm to ensure the master's data consistency and high availability.
 - **Monitoring and Metrics**: Curvine features a comprehensive built-in observability metrics system, facilitating detailed monitoring of the performance of each component.
 - **Web Interface**: Provides a web management interface for convenient system monitoring and management.
@@ -142,6 +142,20 @@ make docker-build
 # or use curvine-compile:build-cached docker images to build, this image already cached most dependency crates
 make docker-build-cached
 ```
+
+**RDMA Support (Optional):**
+
+For high-performance zero-copy transfers with RDMA-capable hardware:
+
+```bash
+# Build with RDMA support
+make build ARGS="-p core --features rdma"
+
+# Or using build.sh
+sh build/build.sh -p core --features rdma
+```
+
+See [RDMA Integration Guide](docs/rdma-integration.md) for hardware requirements, configuration, and deployment instructions.
 
 After successful compilation, target file will be generated in the build/dist directory. This file is the Curvine installation package that can be used for deployment or building images.
 

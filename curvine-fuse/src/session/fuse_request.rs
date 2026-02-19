@@ -19,7 +19,9 @@ use crate::session::FuseOpCode::{self, *};
 use crate::FuseResult;
 use crate::FUSE_IN_HEADER_LEN;
 use orpc::{err_box, CommonResult};
+use std::convert::TryInto;
 use std::fmt::{Display, Formatter};
+use std::mem::size_of;
 use tokio_util::bytes::Bytes;
 
 // fuse request data
@@ -109,10 +111,20 @@ impl FuseRequest {
         let header: &fuse_in_header = decoder.get_struct()?;
 
         let op = match self.opcode {
-            FUSE_INIT => FuseOperator::Init(Init {
-                header,
-                arg: decoder.get_struct()?,
-            }),
+            FUSE_INIT => {
+                let arg = decoder.get_struct()?;
+                let mut flags2 = 0;
+                if decoder.len() >= size_of::<u32>() {
+                    let raw = decoder.get_slice(size_of::<u32>())?;
+                    flags2 = u32::from_ne_bytes(raw.try_into().expect("slice length checked"));
+                    let _ = decoder.get_all()?;
+                }
+                FuseOperator::Init(Init {
+                    header,
+                    arg,
+                    flags2,
+                })
+            }
 
             FUSE_LOOKUP => FuseOperator::Lookup(Lookup {
                 header,

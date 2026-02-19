@@ -13,22 +13,62 @@
 // limitations under the License.
 
 use crate::worker::block::BlockStore;
+#[cfg(feature = "rdma")]
+use crate::worker::handler::BlockHandler::RdmaReader;
 use crate::worker::handler::BlockHandler::{BatchWriter, Reader, Writer};
 use crate::worker::handler::{BatchWriteHandler, ReadHandler, WriteHandler};
+#[cfg(feature = "rdma")]
+use crate::worker::handler::RdmaReadHandler;
+#[cfg(feature = "rdma")]
+use crate::worker::handler::PageCacheTable;
+#[cfg(feature = "rdma")]
+use crate::worker::rdma::TransferEngineManager;
 use curvine_common::error::FsError;
 use curvine_common::fs::RpcCode;
 use curvine_common::FsResult;
 use orpc::handler::MessageHandler;
 use orpc::message::Message;
 use orpc::{err_box, CommonResult};
+#[cfg(feature = "rdma")]
+use std::sync::Arc;
 
 pub enum BlockHandler {
     Writer(WriteHandler),
     Reader(ReadHandler),
+    #[cfg(feature = "rdma")]
+    RdmaReader(RdmaReadHandler),
     BatchWriter(BatchWriteHandler),
 }
 
 impl BlockHandler {
+    #[cfg(feature = "rdma")]
+    pub fn new(
+        code: RpcCode,
+        store: BlockStore,
+        rdma_manager: Option<Arc<TransferEngineManager>>,
+        page_cache_table: Option<Arc<PageCacheTable>>,
+    ) -> CommonResult<Self> {
+        let handler = match code {
+            RpcCode::WriteBlock => Writer(WriteHandler::new(store)),
+
+            RpcCode::ReadBlock => {
+                // Use RDMA reader if RDMA manager is available
+                if rdma_manager.is_some() {
+                    RdmaReader(RdmaReadHandler::new(store, rdma_manager, page_cache_table))
+                } else {
+                    Reader(ReadHandler::new(store))
+                }
+            }
+
+            RpcCode::WriteBlocksBatch => BatchWriter(BatchWriteHandler::new(store)),
+
+            code => return err_box!("Unsupported request type: {:?}", code),
+        };
+
+        Ok(handler)
+    }
+
+    #[cfg(not(feature = "rdma"))]
     pub fn new(code: RpcCode, store: BlockStore) -> CommonResult<Self> {
         let handler = match code {
             RpcCode::WriteBlock => Writer(WriteHandler::new(store)),
@@ -47,16 +87,39 @@ impl BlockHandler {
 impl MessageHandler for BlockHandler {
     type Error = FsError;
 
+    fn is_sync(&self, msg: &Message) -> bool {
+        match self {
+            #[cfg(feature = "rdma")]
+            RdmaReader(h) => h.is_sync(msg),
+            _ => true,
+        }
+    }
+
     fn handle(&mut self, msg: &Message) -> FsResult<Message> {
         let response = match self {
             Writer(h) => h.handle(msg),
             Reader(h) => h.handle(msg),
+            #[cfg(feature = "rdma")]
+            RdmaReader(h) => h.handle(msg),
             BatchWriter(h) => h.handle(msg),
         };
 
         match response {
             Ok(v) => Ok(v),
             Err(e) => Ok(msg.error_ext(&e)),
+        }
+    }
+
+    #[cfg(feature = "rdma")]
+    fn async_handle(
+        &mut self,
+        msg: Message,
+    ) -> impl std::future::Future<Output = FsResult<Message>> + Send {
+        async move {
+            match self {
+                RdmaReader(h) => h.async_handle(msg).await,
+                _ => unreachable!("async_handle called on non-RDMA handler"),
+            }
         }
     }
 }

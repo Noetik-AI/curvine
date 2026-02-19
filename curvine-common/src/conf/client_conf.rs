@@ -21,6 +21,9 @@ use orpc::CommonResult;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+#[cfg(feature = "rdma")]
+use crate::rdma::RdmaClientConfig;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ClientConf {
@@ -212,6 +215,10 @@ pub struct ClientConf {
 
     // Sequential read check threshold
     pub sequential_read_threshold: u64,
+
+    // RDMA configuration
+    #[cfg(feature = "rdma")]
+    pub rdma: RdmaClientConfig,
 }
 
 impl ClientConf {
@@ -416,6 +423,8 @@ impl Default for ClientConf {
             large_file_size_str: "10GB".to_string(),
             max_read_parallel: 8,
             sequential_read_threshold: 7,
+            #[cfg(feature = "rdma")]
+            rdma: RdmaClientConfig::default(),
         };
 
         conf.init().unwrap();

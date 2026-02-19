@@ -1,0 +1,33 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: curvine-config
+  namespace: curvine-system
+  labels:
+    app.kubernetes.io/component: controller
+    app.kubernetes.io/name: curvine-csi-controller
+data:
+  curvine-cluster.toml: |
+    [master]
+    hostname = "cv-master-0.cv-master-svc.curvine.svc.cluster.local"
+    rpc_port = 8995
+
+    # Customer service configuration.
+    [client]
+    master_addrs = [
+        { hostname = "cv-master-0.cv-master-svc.curvine.svc.cluster.local", port = 8995 }
+    ]
+
+    # fuse configuration
+    [fuse]
+    debug = true
+    log = { level = "debug", log_dir = "/opt/curvine", file_name = "fuse.log" }
+
+    # The log configuration of the customer service side, and the customer service side of rust, java, and fuse use this log file.
+    [log]
+    level = "debug"
+    log_dir = "/opt/curvine"
+    file_name = "curvine.log"
+  curvine-env.sh: |
+    export CURVINE_HOME="$(cd "$(dirname "$0")"/..; pwd)"
+    export CURVINE_CONF_FILE=$CURVINE_HOME/conf/curvine-cluster.toml

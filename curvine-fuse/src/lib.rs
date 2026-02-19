@@ -83,7 +83,6 @@ pub const FUSE_SPLICE_READ: u32 = 1 << 9;
 pub const FUSE_ASYNC_DIO: u32 = 1 << 15;
 
 pub const FUSE_DO_READDIRPLUS: u32 = 1 << 13;
-
 pub const FUSE_READDIRPLUS_AUTO: u32 = 1 << 14;
 
 pub const FUSE_WRITEBACK_CACHE: u32 = 1 << 16;

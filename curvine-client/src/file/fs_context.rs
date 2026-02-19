@@ -47,6 +47,8 @@ pub struct FsContext {
     pub(crate) os_cache: CacheManager,
     pub(crate) failed_workers: Cache<u32, WorkerAddress, BuildHasherDefault<FxHasher>>,
     pub(crate) block_pool: Arc<BlockClientPool>,
+    #[cfg(feature = "rdma")]
+    pub(crate) rdma_manager: Option<Arc<crate::rdma::ClientRdmaManager>>,
 }
 
 impl FsContext {
@@ -57,7 +59,11 @@ impl FsContext {
 
     pub fn with_rt(conf: ClusterConf, rt: Arc<Runtime>) -> FsResult<Self> {
         let hostname = conf.client.hostname.to_owned();
-        let ip = NetUtils::local_ip(&hostname);
+        // Try to get POD_IP from environment (set by Kubernetes) for clients running in pods
+        let ip = std::env::var("POD_IP")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| NetUtils::local_ip(&hostname));
         let client_addr = ClientAddress {
             client_name: Utils::uuid(),
             hostname,
@@ -91,6 +97,45 @@ impl FsContext {
             conf.client.block_conn_idle_time.as_millis() as u64,
         ));
 
+        #[cfg(feature = "rdma")]
+        let rdma_manager = if conf.client.rdma.enable_rdma {
+            log::info!(
+                "Client RDMA init: domains={}, pool={}MB, pin_worker_cpu={}, pin_uvm_cpu={}",
+                conf.client.rdma.rdma_num_domains,
+                conf.client.rdma.rdma_memory_pool_mb,
+                conf.client.rdma.rdma_pin_worker_cpu,
+                conf.client.rdma.rdma_pin_uvm_cpu,
+            );
+            match crate::rdma::ClientRdmaManager::new(
+                conf.client.rdma.rdma_num_domains,
+                conf.client.rdma.rdma_pin_worker_cpu,
+                conf.client.rdma.rdma_pin_uvm_cpu,
+                conf.client.rdma.rdma_memory_pool_mb,
+            ) {
+                Ok(manager) => {
+                    let (offset, allocs, deallocs, free_blocks, _) = manager.pool_stats();
+                    log::info!(
+                        "Client RDMA initialized successfully: pool={}MB, offset={}, allocs={}, deallocs={}, free_blocks={}",
+                        conf.client.rdma.rdma_memory_pool_mb, offset, allocs, deallocs, free_blocks
+                    );
+                    Some(Arc::new(manager))
+                }
+                Err(e) => {
+                    log::error!(
+                        "Client RDMA init FAILED (all reads will use TCP): {}. \
+                         Config: rdma_num_domains={}, rdma_memory_pool_mb={}",
+                        e,
+                        conf.client.rdma.rdma_num_domains,
+                        conf.client.rdma.rdma_memory_pool_mb,
+                    );
+                    None
+                }
+            }
+        } else {
+            log::info!("Client RDMA disabled by config (enable_rdma=false)");
+            None
+        };
+
         let context = Self {
             conf,
             connector: Arc::new(connector),
@@ -98,6 +143,8 @@ impl FsContext {
             os_cache,
             failed_workers: exclude_workers,
             block_pool,
+            #[cfg(feature = "rdma")]
+            rdma_manager,
         };
         Ok(context)
     }
@@ -136,6 +183,21 @@ impl FsContext {
 
     pub fn read_chunk_size(&self) -> usize {
         self.conf.client.read_chunk_size
+    }
+
+    #[cfg(feature = "rdma")]
+    pub fn rdma_manager(&self) -> Option<&Arc<crate::rdma::ClientRdmaManager>> {
+        self.rdma_manager.as_ref()
+    }
+
+    #[cfg(feature = "rdma")]
+    pub fn has_rdma(&self) -> bool {
+        self.rdma_manager.is_some()
+    }
+
+    #[cfg(not(feature = "rdma"))]
+    pub fn has_rdma(&self) -> bool {
+        false
     }
 
     pub fn read_chunk_num(&self) -> usize {

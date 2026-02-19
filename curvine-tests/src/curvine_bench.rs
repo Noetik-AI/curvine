@@ -79,6 +79,25 @@ impl CurvineBench {
 
     pub fn run(&self) -> CommonResult<()> {
         let fs = self.init()?;
+        let warmup = self.action.args.warmup;
+
+        if warmup > 0 {
+            println!("Warmup: {} round(s)...", warmup);
+            for i in 0..warmup {
+                if self.action.is_fuse() {
+                    self.rt
+                        .block_on(Self::fuse_run(self.rt.clone(), self.action.clone()))?;
+                } else {
+                    self.rt.block_on(Self::fs_run(
+                        fs.clone().unwrap(),
+                        self.rt.clone(),
+                        self.action.clone(),
+                    ))?;
+                }
+                println!("Warmup round {}/{} done", i + 1, warmup);
+            }
+            println!("Warmup complete, starting timed run");
+        }
 
         let speed = SpeedCounter::new();
         let res = if self.action.is_fuse() {

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::worker::block::{BlockActor, BlockStore};
-use crate::worker::handler::{WorkerHandler, WorkerRouterHandler};
+use crate::worker::handler::{HandlerPool, WorkerHandler, WorkerRouterHandler};
 use crate::worker::replication::worker_replication_handler::WorkerReplicationHandler;
 use crate::worker::replication::worker_replication_manager::WorkerReplicationManager;
 use crate::worker::task::TaskManager;
@@ -26,6 +26,7 @@ use once_cell::sync::OnceCell;
 use orpc::common::{LocalTime, Logger};
 use orpc::handler::HandlerService;
 use orpc::io::net::ConnState;
+use orpc::io::net::NetUtils;
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::server::{RpcServer, ServerStateListener};
 use orpc::CommonResult;
@@ -43,6 +44,9 @@ pub struct WorkerService {
     task_manager: Arc<TaskManager>,
     rt: Arc<Runtime>,
     replication_manager: Arc<WorkerReplicationManager>,
+    handler_pool: Arc<HandlerPool>,
+    #[cfg(feature = "rdma")]
+    rdma_manager: Option<Arc<crate::worker::rdma::TransferEngineManager>>,
 }
 
 impl WorkerService {
@@ -54,12 +58,79 @@ impl WorkerService {
         let replication_manager =
             WorkerReplicationManager::new(&store, &rt, conf, &task_manager.get_fs_context());
 
+        #[cfg(feature = "rdma")]
+        let rdma_manager = if conf.worker.rdma.enable_rdma {
+            // Choose direct polling or async callback mode based on configuration
+            let result = if conf.worker.rdma.rdma_direct_polling {
+                info!("Initializing RDMA in DIRECT POLLING mode");
+                crate::worker::rdma::TransferEngineManager::new_direct(
+                    conf.worker.rdma.rdma_num_domains,
+                    conf.worker.rdma.rdma_pin_worker_cpu,
+                    conf.worker.rdma.rdma_pin_uvm_cpu,
+                    conf.worker.rdma.rdma_memory_pool_mb,
+                )
+            } else {
+                info!("Initializing RDMA in ASYNC CALLBACK mode");
+                crate::worker::rdma::TransferEngineManager::new(
+                    conf.worker.rdma.rdma_num_domains,
+                    conf.worker.rdma.rdma_pin_worker_cpu,
+                    conf.worker.rdma.rdma_pin_uvm_cpu,
+                    conf.worker.rdma.rdma_memory_pool_mb,
+                )
+            };
+
+            match result {
+                Ok(manager) => {
+                    info!("RDMA enabled for worker");
+                    Some(Arc::new(manager))
+                }
+                Err(e) => {
+                    log::warn!("Failed to initialize RDMA (fallback to TCP): {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // Initialize page cache table for RDMA (if enabled)
+        #[cfg(feature = "rdma")]
+        let page_cache_table = if rdma_manager.is_some() {
+            let cache_size_mb = conf.worker.rdma.rdma_page_cache_max_size_mb;
+            let table = crate::worker::handler::PageCacheTable::new(cache_size_mb);
+            info!(
+                "Page cache table initialized with max size: {} MB ({:.1} GB)",
+                cache_size_mb,
+                cache_size_mb as f64 / 1024.0
+            );
+            Some(Arc::new(table))
+        } else {
+            None
+        };
+
+        // Initialize handler pool (capacity of 1000 per handler type)
+        // This pre-allocates handlers to eliminate allocation overhead
+        let handler_pool_capacity = 1000;
+        #[cfg(feature = "rdma")]
+        let handler_pool = Arc::new(
+            HandlerPool::new(handler_pool_capacity, store.clone(), rdma_manager.clone(), page_cache_table.clone())?
+        );
+        #[cfg(not(feature = "rdma"))]
+        let handler_pool = Arc::new(
+            HandlerPool::new(handler_pool_capacity, store.clone())?
+        );
+
+        info!("Handler pool initialized with capacity {} per type", handler_pool_capacity);
+
         let ws = Self {
             store,
             conf: conf.clone(),
             task_manager: Arc::new(task_manager),
             rt,
             replication_manager,
+            handler_pool,
+            #[cfg(feature = "rdma")]
+            rdma_manager,
         };
         Ok(ws)
     }
@@ -80,9 +151,12 @@ impl HandlerService for WorkerService {
         WorkerHandler {
             store: self.store.clone(),
             handler: None,
+            handler_pool: self.handler_pool.clone(),
             task_manager: self.task_manager.clone(),
             rt: self.rt.clone(),
             replication_handler: WorkerReplicationHandler::new(&self.replication_manager),
+            #[cfg(feature = "rdma")]
+            rdma_manager: self.rdma_manager.clone(),
         }
     }
 }
@@ -115,6 +189,11 @@ impl Worker {
 
         CLUSTER_CONF.get_or_init(|| conf.clone());
         WORKER_METRICS.get_or_init(|| WorkerMetrics::new(service.store.clone()).unwrap());
+
+        // Warm up the handler pool after metrics are initialized
+        info!("Warming up handler pool...");
+        service.handler_pool.warm_up()?;
+
         conf.print();
 
         let block_store = service.store.clone();
@@ -123,13 +202,27 @@ impl Worker {
         let web_server = WebServer::with_rt(rt.clone(), conf.worker_web_conf(), service.clone());
 
         let net_addr = rpc_server.bind_addr();
+        // Try to get POD_IP from environment (set by Kubernetes)
+        let ip_addr = std::env::var("POD_IP")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| NetUtils::local_ip(&net_addr.hostname));
+
+        #[cfg(feature = "rdma")]
+        let rdma_capability = service.rdma_manager.as_ref().map(|m| m.get_capability());
+        #[cfg(not(feature = "rdma"))]
+        let rdma_capability: Option<curvine_common::rdma::RdmaCapability> = None;
+
         let addr = WorkerAddress {
             worker_id,
-            hostname: net_addr.hostname.to_owned(),
-            ip_addr: net_addr.hostname.to_owned(),
+            hostname: ip_addr.clone(),
+            ip_addr,
             rpc_port: net_addr.port as u32,
             web_port: conf.worker.web_port as u32,
+            rdma_capability,
         };
+
+        println!("worker addr: {:#?}", addr);
         let block_actor = BlockActor::new(
             rt.clone(),
             &conf,
@@ -169,6 +262,52 @@ impl Worker {
                 info!("Starting S3 gateway alongside worker");
                 let worker_rt = self.rpc_server.clone_rt();
                 Self::start_s3_gateway(conf.clone(), worker_rt).await;
+            }
+        }
+
+        // step 2.5: Start RDMA polling task if direct polling is enabled
+        #[cfg(feature = "rdma")]
+        if conf.worker.rdma.enable_rdma && conf.worker.rdma.rdma_direct_polling {
+            let service = self.rpc_server.service();
+            if let Some(ref rdma_manager) = service.rdma_manager {
+                if rdma_manager.is_direct_polling_enabled() {
+                    let rdma_mgr = rdma_manager.clone();
+                    let poll_interval_us = conf.worker.rdma.rdma_poll_interval_us;
+
+                    info!(
+                        "Starting RDMA direct polling task (interval: {}µs)",
+                        poll_interval_us
+                    );
+
+                    // Spawn dedicated OS thread for RDMA polling.
+                    // IMPORTANT: Must be a std::thread, NOT a Tokio task, because
+                    // completion callbacks use blocking_send() which panics inside
+                    // an async Tokio context.
+                    std::thread::Builder::new()
+                        .name("rdma-poll".to_string())
+                        .spawn(move || {
+                            let poll_interval = std::time::Duration::from_micros(poll_interval_us);
+                            loop {
+                                match rdma_mgr.poll_completions() {
+                                    Ok(count) if count > 0 => {
+                                        // Completions processed, poll again immediately
+                                        continue;
+                                    }
+                                    Ok(_) => {
+                                        // No completions, sleep before next poll
+                                        std::thread::sleep(poll_interval);
+                                    }
+                                    Err(e) => {
+                                        log::error!("RDMA polling error: {}", e);
+                                        std::thread::sleep(std::time::Duration::from_millis(1));
+                                    }
+                                }
+                            }
+                        })
+                        .expect("Failed to spawn RDMA polling thread");
+
+                    info!("RDMA direct polling task started successfully");
+                }
             }
         }
 

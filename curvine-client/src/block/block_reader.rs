@@ -12,11 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(not(feature = "rdma"))]
 use crate::block::block_reader::ReaderAdapter::{Hole, Local, Remote};
+#[cfg(feature = "rdma")]
+use crate::block::block_reader::ReaderAdapter::{Hole, Local, Rdma, Remote};
 use crate::block::{BlockReaderHole, BlockReaderLocal, BlockReaderRemote};
+#[cfg(feature = "rdma")]
+use crate::block::BlockReaderRdma;
 use crate::file::FsContext;
 use curvine_common::state::{ClientAddress, ExtendedBlock, LocatedBlock, WorkerAddress};
 use curvine_common::FsResult;
+#[cfg(feature = "rdma")]
+use log::info;
 use log::warn;
 use orpc::common::Utils;
 use orpc::error::ErrorExt;
@@ -28,6 +35,8 @@ use std::sync::Arc;
 enum ReaderAdapter {
     Local(BlockReaderLocal),
     Remote(BlockReaderRemote),
+    #[cfg(feature = "rdma")]
+    Rdma(BlockReaderRdma),
     Hole(BlockReaderHole),
 }
 
@@ -36,6 +45,8 @@ impl ReaderAdapter {
         match self {
             Local(r) => r.read().await,
             Remote(r) => r.read().await,
+            #[cfg(feature = "rdma")]
+            Rdma(r) => r.read().await,
             Hole(r) => r.read(),
         }
     }
@@ -45,6 +56,8 @@ impl ReaderAdapter {
         match self {
             Local(r) => r.blocking_read(),
             Remote(r) => rt.block_on(r.read()),
+            #[cfg(feature = "rdma")]
+            Rdma(r) => rt.block_on(r.read()),
             Hole(r) => r.read(),
         }
     }
@@ -53,6 +66,8 @@ impl ReaderAdapter {
         match self {
             Local(r) => r.complete().await,
             Remote(r) => r.complete().await,
+            #[cfg(feature = "rdma")]
+            Rdma(r) => r.complete().await,
             Hole(r) => r.complete(),
         }
     }
@@ -61,6 +76,8 @@ impl ReaderAdapter {
         match self {
             Local(r) => r.remaining(),
             Remote(r) => r.remaining(),
+            #[cfg(feature = "rdma")]
+            Rdma(r) => r.remaining(),
             Hole(r) => r.remaining(),
         }
     }
@@ -69,6 +86,8 @@ impl ReaderAdapter {
         match self {
             Local(r) => r.seek(pos),
             Remote(r) => r.seek(pos),
+            #[cfg(feature = "rdma")]
+            Rdma(r) => r.seek(pos),
             Hole(r) => r.seek(pos),
         }
     }
@@ -77,6 +96,8 @@ impl ReaderAdapter {
         match self {
             Local(r) => r.pos(),
             Remote(r) => r.pos(),
+            #[cfg(feature = "rdma")]
+            Rdma(r) => r.pos(),
             Hole(r) => r.pos(),
         }
     }
@@ -85,6 +106,8 @@ impl ReaderAdapter {
         match self {
             Local(r) => r.len(),
             Remote(r) => r.len(),
+            #[cfg(feature = "rdma")]
+            Rdma(r) => r.len(),
             Hole(r) => r.len(),
         }
     }
@@ -93,6 +116,8 @@ impl ReaderAdapter {
         match self {
             Local(r) => r.block_id(),
             Remote(r) => r.block_id(),
+            #[cfg(feature = "rdma")]
+            Rdma(r) => r.block_id(),
             Hole(r) => r.block_id(),
         }
     }
@@ -101,6 +126,8 @@ impl ReaderAdapter {
         match self {
             Local(r) => r.worker_address(),
             Remote(r) => r.worker_address(),
+            #[cfg(feature = "rdma")]
+            Rdma(r) => r.worker_address(),
             Hole(r) => r.worker_address(),
         }
     }
@@ -165,6 +192,44 @@ impl BlockReader {
         Ok(locs)
     }
 
+    #[cfg(feature = "rdma")]
+    fn should_use_rdma(fs_context: &FsContext, worker: &WorkerAddress) -> bool {
+        // Check if client has RDMA enabled
+        if !fs_context.has_rdma() {
+            warn!("[RDMA] client has_rdma=false (rdma_manager not initialized), using TCP for worker {}", worker);
+            return false;
+        }
+
+        // Check if worker advertises RDMA capability
+        match &worker.rdma_capability {
+            Some(rdma_cap) => {
+                if !rdma_cap.enabled {
+                    info!("[RDMA] worker {} rdma_capability.enabled=false, using TCP", worker);
+                    return false;
+                }
+                if rdma_cap.domain_addresses.is_empty() {
+                    warn!(
+                        "[RDMA] worker {} rdma_capability has 0 domain_addresses, using TCP",
+                        worker
+                    );
+                    return false;
+                }
+                info!(
+                    "[RDMA] negotiation OK: client=ready, worker={}, domains={}",
+                    worker, rdma_cap.domain_addresses.len()
+                );
+                true
+            }
+            None => {
+                warn!(
+                    "[RDMA] worker {} has rdma_capability=None (master may not forward RDMA info), using TCP",
+                    worker
+                );
+                false
+            }
+        }
+    }
+
     async fn get_reader(
         locs: &[WorkerAddress],
         block: ExtendedBlock,
@@ -192,6 +257,42 @@ impl BlockReader {
                     .await?;
                     Ok(Local(reader))
                 } else {
+                    #[cfg(feature = "rdma")]
+                    {
+                        // Try RDMA if both client and worker support it
+                        if Self::should_use_rdma(&fs_context, loc) {
+                            if let Some(rdma_manager) = fs_context.rdma_manager() {
+                                match BlockReaderRdma::new(
+                                    &fs_context,
+                                    rdma_manager.clone(),
+                                    block.clone(),
+                                    loc.clone(),
+                                    off,
+                                    len,
+                                )
+                                .await
+                                {
+                                    Ok(reader) => {
+                                        info!(
+                                            "[RDMA] created BlockReaderRdma for block={}, worker={}",
+                                            block.id, loc
+                                        );
+                                        return Ok(Rdma(reader));
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "[RDMA] BlockReaderRdma creation FAILED for block={}, worker={}, falling back to TCP: {}",
+                                            block.id, loc, e
+                                        );
+                                    }
+                                }
+                            } else {
+                                warn!("[RDMA] should_use_rdma=true but rdma_manager() returned None");
+                            }
+                        }
+                    }
+
+                    // Fall back to standard TCP reader
                     let reader =
                         BlockReaderRemote::new(&fs_context, block.clone(), loc.clone(), off, len)
                             .await?;

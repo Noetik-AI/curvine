@@ -113,6 +113,7 @@ impl ReadHandler {
             len: meta.len,
             path: ternary!(context.short_circuit, Some(path), None),
             storage_type: meta.storage_type().into(),
+            rdma_transfer: Some(false),
         };
 
         let _ = mem::replace(&mut self.file, file);

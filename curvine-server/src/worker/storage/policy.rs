@@ -15,6 +15,7 @@
 use crate::worker::storage::VfsDir;
 use curvine_common::state::{ExtendedBlock, FileType, StorageType};
 use indexmap::IndexMap;
+use log::error;
 use orpc::common::ByteUnit;
 use orpc::{err_box, CommonResult};
 use std::collections::HashMap;
@@ -65,6 +66,29 @@ impl RobinChoosingPolicy {
         if let Some(v) = res {
             Ok(v)
         } else {
+            // Log detailed diagnostics for every directory
+            error!(
+                "STORAGE POLICY FAILED: No directory can allocate block_id={}, size={}, storage_type={:?}, num_dirs={}",
+                block.id, block.size_string(), block.storage_type, dirs.len()
+            );
+            for (id, dir) in dirs.iter() {
+                let type_match = block.storage_type == StorageType::Disk || block.storage_type == dir.storage_type();
+                error!(
+                    "  dir[{}]: path={}, storage_type={:?}, type_match={}, failed={}, capacity={}, fs_used={}, available={}, reserved={}, block_size={}",
+                    id,
+                    dir.path_str(),
+                    dir.storage_type(),
+                    type_match,
+                    dir.is_failed(),
+                    ByteUnit::byte_to_string(dir.capacity() as u64),
+                    ByteUnit::byte_to_string(dir.fs_used() as u64),
+                    ByteUnit::byte_to_string(dir.available() as u64),
+                    ByteUnit::byte_to_string(dir.reserved_bytes() as u64),
+                    ByteUnit::byte_to_string(block.len as u64),
+                );
+            }
+            // Log stack trace
+            error!("Stack trace:\n{:?}", std::backtrace::Backtrace::force_capture());
             err_box!("Not enough space to save {} block", block.size_string())
         }
     }

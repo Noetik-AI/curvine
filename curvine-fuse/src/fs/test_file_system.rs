@@ -65,9 +65,15 @@ impl FileSystem for TestFileSystem {
             #[cfg(feature = "fuse3")]
             max_pages: 0,
             #[cfg(feature = "fuse3")]
-            padding: 0,
+            map_alignment: 0,
             #[cfg(feature = "fuse3")]
-            unused: 0,
+            flags2: 0,
+            #[cfg(feature = "fuse3")]
+            max_stack_depth: 0,
+            #[cfg(feature = "fuse3")]
+            request_timeout: 0,
+            #[cfg(feature = "fuse3")]
+            unused: [0; 11],
         };
 
         Ok(out)

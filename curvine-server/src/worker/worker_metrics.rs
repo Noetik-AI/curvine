@@ -41,6 +41,30 @@ pub struct WorkerMetrics {
     pub(crate) num_blocks_to_delete: Gauge,
 
     pub(crate) used_memory_bytes: Gauge,
+
+    // RDMA metrics
+    #[cfg(feature = "rdma")]
+    pub(crate) rdma_enabled: Gauge,
+    #[cfg(feature = "rdma")]
+    pub(crate) rdma_transfers_total: Counter,
+    #[cfg(feature = "rdma")]
+    pub(crate) rdma_bytes_written: Counter,
+    #[cfg(feature = "rdma")]
+    pub(crate) rdma_pool_bytes_allocated: Gauge,
+    #[cfg(feature = "rdma")]
+    pub(crate) rdma_fallback_to_tcp: Counter,
+
+    // Page cache table metrics
+    #[cfg(feature = "rdma")]
+    pub(crate) page_cache_hits: Counter,
+    #[cfg(feature = "rdma")]
+    pub(crate) page_cache_misses: Counter,
+    #[cfg(feature = "rdma")]
+    pub(crate) page_cache_evictions: Counter,
+    #[cfg(feature = "rdma")]
+    pub(crate) page_cache_size_bytes: Gauge,
+    #[cfg(feature = "rdma")]
+    pub(crate) page_cache_entries: Gauge,
 }
 
 impl WorkerMetrics {
@@ -70,6 +94,49 @@ impl WorkerMetrics {
             )?,
 
             used_memory_bytes: m::new_gauge("used_memory_bytes", "Total memory used")?,
+
+            #[cfg(feature = "rdma")]
+            rdma_enabled: m::new_gauge("rdma_enabled", "RDMA enabled (0 or 1)")?,
+            #[cfg(feature = "rdma")]
+            rdma_transfers_total: m::new_counter("rdma_transfers_total", "Total RDMA transfers")?,
+            #[cfg(feature = "rdma")]
+            rdma_bytes_written: m::new_counter("rdma_bytes_written", "Bytes written via RDMA")?,
+            #[cfg(feature = "rdma")]
+            rdma_pool_bytes_allocated: m::new_gauge(
+                "rdma_pool_bytes_allocated",
+                "Bytes allocated in RDMA pool",
+            )?,
+            #[cfg(feature = "rdma")]
+            rdma_fallback_to_tcp: m::new_counter(
+                "rdma_fallback_to_tcp",
+                "Number of RDMA fallbacks to TCP",
+            )?,
+
+            #[cfg(feature = "rdma")]
+            page_cache_hits: m::new_counter(
+                "page_cache_hits",
+                "RDMA page cache hit count",
+            )?,
+            #[cfg(feature = "rdma")]
+            page_cache_misses: m::new_counter(
+                "page_cache_misses",
+                "RDMA page cache miss count",
+            )?,
+            #[cfg(feature = "rdma")]
+            page_cache_evictions: m::new_counter(
+                "page_cache_evictions",
+                "RDMA page cache eviction count",
+            )?,
+            #[cfg(feature = "rdma")]
+            page_cache_size_bytes: m::new_gauge(
+                "page_cache_size_bytes",
+                "Current RDMA page cache size in bytes",
+            )?,
+            #[cfg(feature = "rdma")]
+            page_cache_entries: m::new_gauge(
+                "page_cache_entries",
+                "Current number of RDMA page cache entries",
+            )?,
         };
 
         Ok(wm)

@@ -69,9 +69,15 @@ pub struct fuse_init_out {
     #[cfg(feature = "fuse3")]
     pub max_pages: u16,
     #[cfg(feature = "fuse3")]
-    pub padding: u16,
+    pub map_alignment: u16,
     #[cfg(feature = "fuse3")]
-    pub unused: u32,
+    pub flags2: u32,
+    #[cfg(feature = "fuse3")]
+    pub max_stack_depth: u32,
+    #[cfg(feature = "fuse3")]
+    pub request_timeout: u16,
+    #[cfg(feature = "fuse3")]
+    pub unused: [u16; 11],
 }
 
 #[repr(C)]

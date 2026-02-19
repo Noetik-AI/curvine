@@ -21,6 +21,9 @@ use orpc::{err_box, CommonResult};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "rdma")]
+use crate::rdma::RdmaWorkerConfig;
+
 #[derive(Debug, Clone, Serialize, Default, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct WorkerDataDir {
@@ -159,6 +162,10 @@ pub struct WorkerConf {
 
     // Enable S3 gateway alongside worker
     pub enable_s3_gateway: bool,
+
+    // RDMA configuration
+    #[cfg(feature = "rdma")]
+    pub rdma: RdmaWorkerConfig,
 }
 
 impl WorkerConf {
@@ -203,6 +210,8 @@ impl Default for WorkerConf {
             block_replication_concurrency_limit: 100,
             block_replication_chunk_size: 1024 * 1024,
             enable_s3_gateway: false,
+            #[cfg(feature = "rdma")]
+            rdma: RdmaWorkerConfig::default(),
         }
     }
 }

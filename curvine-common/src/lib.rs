@@ -24,6 +24,8 @@ pub mod state;
 pub mod utils;
 pub mod version;
 
+pub mod rdma;
+
 pub mod proto {
     include!(concat!(env!("OUT_DIR"), "/protos/proto.rs"));
 

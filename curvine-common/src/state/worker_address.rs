@@ -17,6 +17,8 @@ use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
 use std::hash::{Hash, Hasher};
 
+use crate::rdma::RdmaCapability;
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WorkerAddress {
     pub worker_id: u32,
@@ -24,6 +26,10 @@ pub struct WorkerAddress {
     pub ip_addr: String,
     pub rpc_port: u32,
     pub web_port: u32,
+    /// RDMA capability advertised by this worker (always present for transparent forwarding
+    /// through master, even when master is compiled without RDMA feature).
+    #[serde(default)]
+    pub rdma_capability: Option<RdmaCapability>,
 }
 
 impl WorkerAddress {
@@ -37,6 +43,13 @@ impl WorkerAddress {
 
     pub fn inet_addr(&self) -> InetAddr {
         InetAddr::new(self.ip_addr.clone(), self.rpc_port as u16)
+    }
+
+    pub fn supports_rdma(&self) -> bool {
+        self.rdma_capability
+            .as_ref()
+            .map(|cap| cap.is_enabled())
+            .unwrap_or(false)
     }
 }
 

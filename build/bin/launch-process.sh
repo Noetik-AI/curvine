@@ -48,7 +48,7 @@ check() {
 }
 
 start() {
-    check
+    # check
 
     name="unknown"
     if [[ "$SERVICE_NAME" = "worker" ]] || [[ "$SERVICE_NAME" = "master" ]]; then

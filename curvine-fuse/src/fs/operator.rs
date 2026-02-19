@@ -127,6 +127,7 @@ pub struct ReadDir<'a> {
 pub struct Init<'a> {
     pub header: &'a fuse_in_header,
     pub arg: &'a fuse_init_in,
+    pub flags2: u32,
 }
 
 #[derive(Debug)]

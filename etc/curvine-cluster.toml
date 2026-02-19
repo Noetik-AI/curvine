@@ -23,7 +23,7 @@ ttl_retry_interval = "5s"          # Interval between retry attempts
 # masta ha raft configuration.
 [journal]
 journal_addrs = [
-    {id = 1, hostname = "localhost", port = 8996}
+    {id = 1, hostname = "0.0.0.0", port = 8996}
 ]
 journal_dir = "testing/journal"
 
@@ -37,9 +37,32 @@ data_dir = [
 log = { level = "info", log_dir = "stdout", file_name = "worker.log" }
 enable_s3_gateway = false
 
+# RDMA configuration for worker
+[worker.rdma]
+enable_rdma = true                       # Enabled for high-performance transfers
+rdma_num_domains = 2                     # Number of RDMA domains (typically 1 per NIC)
+rdma_pin_worker_cpu = 0                  # CPU core to pin worker thread
+rdma_pin_uvm_cpu = 1                     # CPU core to pin UVM thread
+rdma_memory_pool_mb = 40960              # RDMA staging buffer pool size in MB (for fallback path)
+rdma_page_cache_max_size_mb = 20480      # RDMA page cache table max size in MB (20GB, for persistent cached registrations)
+rdma_inline_threshold = 65536            # Use RDMA for transfers > 64KB
+rdma_direct_polling = true               # RECOMMENDED: Enable direct polling mode for 5-10x lower latency (default: true)
+rdma_poll_interval_us = 10               # Polling interval in microseconds (default: 10µs, range: 1-100µs)
+
 
 # Customer service configuration.
 [client]
+master_addrs = [
+    { hostname = "ray-cluster-hyperpod-head-svc.training.svc.cluster.local", port = 8995 }
+]
+
+# RDMA configuration for client
+[client.rdma]
+enable_rdma = true                  # Enabled for high-performance transfers
+rdma_num_domains = 2                # Number of RDMA domains
+rdma_memory_pool_mb = 512           # RDMA memory pool size in MB (must be >= max block size)
+rdma_pin_worker_cpu = 0             # CPU core to pin worker thread
+rdma_pin_uvm_cpu = 1                # CPU core to pin UVM thread
 
 # fuse configuration
 [fuse]

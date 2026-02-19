@@ -13,8 +13,8 @@ spec:
         app: curvine-csi-node
     spec:
       serviceAccountName: curvine-csi-node-sa
-      tolerations:
-        - operator: Exists
+      # tolerations:
+      #   - operator: Exists
       priorityClassName: system-node-critical
       dnsPolicy: ClusterFirstWithHostNet
 
@@ -27,6 +27,8 @@ spec:
             - --endpoint=$(CSI_ENDPOINT)
             - --nodeid=$(NODE_NAME)
           env:
+            - name: RUST_LOG
+              value: debug
             - name: CSI_ENDPOINT
               value: unix:///csi/csi.sock
             - name: NODE_NAME
