@@ -52,6 +52,10 @@ allow_stale_cache = true
 # master configuration
 [master]
 meta_dir = "testing/meta"
+# Graceful worker departures retain locations indefinitely unless configured.
+# "0s" schedules cleanup at the next worker check; "5m" allows a rejoin window.
+# Departed workers are excluded from read locations throughout that window.
+# worker_departure_retention = "0s"
 # Worker selection policy: local, robin, random, load_based, or weighted.
 # local prefers a local worker for the first replica and assigns the rest via the weighted policy.
 # worker_policy = "weighted"

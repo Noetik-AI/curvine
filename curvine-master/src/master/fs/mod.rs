@@ -13,6 +13,7 @@
 // limitations under the License.
 
 mod worker_manager;
+mod worker_retention;
 pub use self::worker_manager::WorkerManager;
 
 mod heartbeat_checker;
