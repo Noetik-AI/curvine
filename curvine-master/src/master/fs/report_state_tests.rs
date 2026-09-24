@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::*;
-use crate::master::meta::BlockMeta;
+use crate::master::meta::{BlockMeta, InodeId};
 use curvine_runtime::common::Utils;
 
 const WORKER: u32 = 101;
@@ -202,5 +202,229 @@ fn reconciliation_deletes_across_batch_boundaries_without_touching_other_worker(
     );
     assert_inventory(&fs, &ids, &[])?;
     fs.run_full_block_reconcile(WORKER, None);
+    Ok(())
+}
+
+#[test]
+fn retried_final_page_preserves_cleanup_and_replays_deletion_response() -> CommonResult<()> {
+    let (fs, ids) = fixture("final-page-retry", 3)?;
+    install_running(&fs, None);
+    let obsolete = InodeId::create_block_id(InodeId::get_id(ids[0]), 100)?;
+    fs.block_report_request(
+        11,
+        page(&ids[..1], true, 2, BlockReportStatus::Finalized),
+        None,
+    )?;
+    let final_page = || page(&[obsolete], true, 2, BlockReportStatus::Finalized);
+    assert_eq!(
+        fs.block_report_request(12, final_page(), None)?
+            .delete_blocks,
+        vec![obsolete]
+    );
+    let generation = fs.full_block_reconciles.lock()[&WORKER].generation;
+
+    // The worker received no response, so it retries the same final RPC while
+    // cleanup is queued. Retrying must neither cancel cleanup nor open a session.
+    assert_eq!(
+        fs.block_report_request(12, final_page(), None)?
+            .delete_blocks,
+        vec![obsolete]
+    );
+    {
+        let reconciles = fs.full_block_reconciles.lock();
+        let state = &reconciles[&WORKER];
+        assert_eq!(state.generation, generation);
+        assert!(state.pending.is_some());
+    }
+    assert!(fs.full_block_reports.lock().is_empty());
+    fs.run_full_block_reconcile(WORKER, None);
+    assert_inventory(&fs, &ids, &ids[..1])?;
+
+    assert_eq!(
+        fs.block_report_request(12, final_page(), None)?
+            .delete_blocks,
+        vec![obsolete]
+    );
+    assert!(fs.full_block_reports.lock().is_empty());
+    assert!(fs.full_block_reconciles.lock().is_empty());
+    Ok(())
+}
+
+#[test]
+fn reconcile_batches_admit_reports_from_other_workers() -> CommonResult<()> {
+    let (fs, ids) = fixture(
+        "reconcile-admission",
+        MasterFilesystem::FULL_BLOCK_RECONCILE_DELETE_CHUNK + 1,
+    )?;
+    install_running(&fs, None);
+    let mut batches = 0;
+    let removed = fs.apply_full_block_reconcile_with_hook(WORKER, 1, ids.clone(), || {
+        assert!(
+            fs.full_block_reconciles.try_lock().is_some(),
+            "state mutex must be released between deletion batches"
+        );
+        assert!(fs.fs_dir.try_write().is_some());
+        batches += 1;
+        let mut other_page = page(&ids[..1], true, 2, BlockReportStatus::Finalized);
+        other_page.worker_id = 102;
+        fs.block_report(other_page, None).unwrap();
+    })?;
+    assert_eq!(batches, 2);
+    assert_eq!(removed, ids);
+    assert!(fs.fs_dir.read().get_worker_block_ids(WORKER)?.is_empty());
+    assert_eq!(fs.fs_dir.read().get_worker_block_ids(102)?, ids[..1]);
+    fs.run_full_block_reconcile(WORKER, None);
+    Ok(())
+}
+
+#[test]
+fn reconcile_cancellation_between_batches_preserves_new_report() -> CommonResult<()> {
+    let size = MasterFilesystem::FULL_BLOCK_RECONCILE_DELETE_CHUNK;
+    let (fs, ids) = fixture("reconcile-cancel-batch", size + 2)?;
+    install_running(&fs, None);
+    let mut batches = 0;
+    let removed = fs.apply_full_block_reconcile_with_hook(WORKER, 1, ids.clone(), || {
+        assert!(
+            fs.full_block_reconciles.try_lock().is_some(),
+            "new reports must be able to cancel between batches"
+        );
+        batches += 1;
+        fs.block_report(
+            page(&ids[size..size + 1], true, 2, BlockReportStatus::Finalized),
+            None,
+        )
+        .unwrap();
+    })?;
+    assert_eq!(batches, 1);
+    assert_eq!(
+        removed,
+        ids[..size],
+        "replication should see only committed deletions"
+    );
+    assert_inventory(&fs, &ids, &ids[size..])?;
+    fs.run_full_block_reconcile(WORKER, None);
+    Ok(())
+}
+
+#[test]
+fn failed_final_page_can_retry_after_inode_repair() -> CommonResult<()> {
+    use crate::master::meta::store::RocksInodeStore;
+    use curvine_rocksdb::RocksUtils;
+
+    let (fs, ids) = fixture("failed-final-page", 3)?;
+    install_running(&fs, None);
+    fs.block_report_request(
+        21,
+        page(&ids[..1], true, 2, BlockReportStatus::Finalized),
+        None,
+    )?;
+    let key = RocksUtils::i64_to_bytes(InodeId::get_id(ids[0]));
+    let original = {
+        let fs_dir = fs.fs_dir.write();
+        let db = &fs_dir.store.store.db;
+        let bytes = db.get_cf(RocksInodeStore::CF_INODES, key)?.unwrap();
+        db.put_cf(RocksInodeStore::CF_INODES, key, [0xff])?;
+        bytes
+    };
+    let final_page = || page(&ids[1..2], true, 2, BlockReportStatus::Finalized);
+    assert!(fs.block_report_request(22, final_page(), None).is_err());
+    assert!(!fs.full_block_report_requests.lock().contains_key(&WORKER));
+    assert_eq!(
+        fs.full_block_reports.lock()[&WORKER].reported_blocks,
+        [ids[0]].into_iter().collect()
+    );
+    fs.fs_dir
+        .write()
+        .store
+        .store
+        .db
+        .put_cf(RocksInodeStore::CF_INODES, key, original)?;
+    fs.block_report_request(22, final_page(), None)?;
+    fs.run_full_block_reconcile(WORKER, None);
+    assert_inventory(&fs, &ids, &ids[..2])?;
+    Ok(())
+}
+
+#[test]
+fn in_flight_full_page_retry_waits_for_original_response() -> CommonResult<()> {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    let (fs, ids) = fixture("in-flight-page", 2)?;
+    install_running(&fs, None);
+    let report = || {
+        fs.block_report_request(
+            31,
+            page(&ids[..1], true, 1, BlockReportStatus::Finalized),
+            None,
+        )
+    };
+    std::thread::scope(|scope| {
+        let metadata = fs.fs_dir.write();
+        let first = scope.spawn(report);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let claimed = loop {
+            if fs
+                .full_block_report_requests
+                .lock()
+                .get(&WORKER)
+                .is_some_and(|request| {
+                    request.request_id == 31 && request.result.try_lock().is_none()
+                })
+            {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        let (sender, receiver) = mpsc::channel();
+        scope.spawn(move || sender.send(report()).unwrap());
+        let early = receiver.recv_timeout(Duration::from_millis(100));
+        // Release the blocked report before assertions or scoped-thread joins.
+        drop(metadata);
+        let first = first.join().unwrap();
+        let (waited, duplicate) = match early {
+            Ok(result) => (false, result),
+            Err(mpsc::RecvTimeoutError::Timeout) => (
+                true,
+                receiver.recv_timeout(Duration::from_secs(10)).unwrap(),
+            ),
+            Err(error) => panic!("retry disconnected: {error}"),
+        };
+        assert!(claimed, "original request must be in flight");
+        assert!(waited, "retry must wait instead of returning an RPC error");
+        assert_eq!(
+            first.unwrap().delete_blocks,
+            duplicate.unwrap().delete_blocks
+        );
+    });
+    assert!(fs.full_block_reports.lock().is_empty());
+    assert_eq!(fs.full_block_reconciles.lock()[&WORKER].generation, 3);
+    assert!(fs.full_block_reconciles.lock()[&WORKER].pending.is_some());
+    fs.run_full_block_reconcile(WORKER, None);
+    assert_inventory(&fs, &ids, &ids[..1])?;
+    Ok(())
+}
+
+#[test]
+fn distinct_full_page_request_still_cancels_old_cleanup() -> CommonResult<()> {
+    let (fs, ids) = fixture("distinct-full-request", 3)?;
+    install_running(&fs, None);
+    fs.block_report_request(
+        41,
+        page(&ids[..1], true, 1, BlockReportStatus::Finalized),
+        None,
+    )?;
+    assert!(fs.full_block_reconciles.lock()[&WORKER].pending.is_some());
+    fs.block_report_request(
+        42,
+        page(&ids[1..2], true, 2, BlockReportStatus::Finalized),
+        None,
+    )?;
+    assert!(fs.full_block_reconciles.lock()[&WORKER].pending.is_none());
+    fs.run_full_block_reconcile(WORKER, None);
+    assert_inventory(&fs, &ids, &ids)?;
     Ok(())
 }
