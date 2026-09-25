@@ -19,7 +19,7 @@ fn failed_rejoin_does_not_cancel_cleanup_forever() -> CommonResult<()> {
     use curvine_model::{HeartbeatStatus, ProtoUtils};
     use curvine_proto::{WorkerHeartbeatRequest, WorkerHeartbeatResponse};
     let mut cluster = Cluster::new("failed-rejoin", 1, |conf| {
-        conf.master.worker_departure_retention = Some("30s".into());
+        conf.master.worker_graceful_exit_block_location_retention = Some("30s".into());
     })?;
     let rt = cluster.rt.clone();
     rt.block_on(async {
@@ -110,7 +110,7 @@ fn report_rpc_retry_returns_same_deletion_and_preserves_current_reads() -> Commo
 #[ignore = "process integration: build/run-worker-lifecycle.py"]
 fn zero_departure_retention_invalidates_cache_and_allows_reload() -> CommonResult<()> {
     let mut cluster = Cluster::new("zero-retention", 2, |conf| {
-        conf.master.worker_departure_retention = Some("0s".into());
+        conf.master.worker_graceful_exit_block_location_retention = Some("0s".into());
     })?;
     let rt = cluster.rt.clone();
     rt.block_on(async {
@@ -158,7 +158,7 @@ fn zero_departure_retention_invalidates_cache_and_allows_reload() -> CommonResul
 #[ignore = "process integration: build/run-worker-lifecycle.py"]
 fn positive_retention_excludes_offline_reads_then_expires() -> CommonResult<()> {
     let mut cluster = Cluster::new("retention-expiry", 1, |conf| {
-        conf.master.worker_departure_retention = Some("3s".into());
+        conf.master.worker_graceful_exit_block_location_retention = Some("3s".into());
     })?;
     let rt = cluster.rt.clone();
     rt.block_on(async {
@@ -192,7 +192,7 @@ fn positive_retention_excludes_offline_reads_then_expires() -> CommonResult<()> 
 #[ignore = "process integration: build/run-worker-lifecycle.py"]
 fn rejoin_before_retention_expiry_cancels_cleanup() -> CommonResult<()> {
     let mut cluster = Cluster::new("retention-cancel", 1, |conf| {
-        conf.master.worker_departure_retention = Some("3s".into());
+        conf.master.worker_graceful_exit_block_location_retention = Some("3s".into());
     })?;
     let rt = cluster.rt.clone();
     rt.block_on(async {
@@ -228,7 +228,7 @@ fn rejoin_before_retention_expiry_cancels_cleanup() -> CommonResult<()> {
 #[ignore = "process integration: build/run-worker-lifecycle.py"]
 fn zero_retention_preserves_native_file_and_surviving_replica() -> CommonResult<()> {
     let mut cluster = Cluster::new("retention-replica", 2, |conf| {
-        conf.master.worker_departure_retention = Some("0s".into());
+        conf.master.worker_graceful_exit_block_location_retention = Some("0s".into());
     })?;
     let rt = cluster.rt.clone();
     rt.block_on(async {

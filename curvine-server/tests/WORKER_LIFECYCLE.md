@@ -45,11 +45,22 @@ corrupt-inode injection and deterministic concurrency boundaries.
 
 ```toml
 [master]
-worker_departure_retention = "0s"
+worker_graceful_exit_block_location_retention = "0s"
 ```
 
-Omitting this setting preserves unlimited retention after a graceful End
-heartbeat. A duration such as `"5m"` retains locations for that rejoin window.
+This timer starts only when the master accepts an explicit `End` heartbeat from
+the currently registered worker session during graceful shutdown. A stale or
+undelivered `End` does not start it. It controls retention of the worker's
+block-location metadata on the master.
+
+Network interruptions, connection errors, and missed heartbeats do **not** start
+this timer or trigger zero-retention cleanup. A prolonged outage can still cause
+the existing heartbeat-loss cleanup after `worker_lost_interval`; that behavior
+is unchanged. Setting this to `"0s"` does not turn a brief network interruption
+into a graceful-departure block flush.
+
+Omitting this setting preserves unlimited retention after an accepted graceful
+`End` heartbeat. A duration such as `"5m"` retains locations for that rejoin window.
 Zero removes the intentional delay: cleanup becomes eligible at the next
 `worker_check_interval` (default 10 seconds), then runs on the master executor.
 It is asynchronous and not guaranteed to finish before shutdown returns.

@@ -98,7 +98,12 @@ impl WorkerManager {
                 self.worker_map.remove(&addr);
                 self.departures.remove(&addr.worker_id);
                 self.departed_sessions.remove(&addr.worker_id);
-                if self.conf.master.worker_departure_retention_unit.is_some() {
+                if self
+                    .conf
+                    .master
+                    .worker_graceful_exit_block_location_retention_unit
+                    .is_some()
+                {
                     // Start precedes inventory reporting. Supersede any old
                     // cleanup, but do not retain forever if startup never
                     // reaches its first Running heartbeat.
@@ -150,7 +155,11 @@ impl WorkerManager {
                 let _ = self.worker_map.remove_offline(addr.worker_id);
                 self.departed_sessions
                     .insert(addr.worker_id, worker_session_id);
-                if let Some(retention) = &self.conf.master.worker_departure_retention_unit {
+                if let Some(retention) = &self
+                    .conf
+                    .master
+                    .worker_graceful_exit_block_location_retention_unit
+                {
                     self.departure_generation += 1;
                     self.departures.insert(
                         addr.worker_id,

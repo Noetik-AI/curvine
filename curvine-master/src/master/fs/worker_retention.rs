@@ -189,11 +189,23 @@ mod tests {
 
     fn manager(retention: Option<&str>) -> WorkerManager {
         let mut conf = ClusterConf::default();
-        conf.master.worker_departure_retention = retention.map(str::to_string);
+        conf.master.worker_graceful_exit_block_location_retention = retention.map(str::to_string);
         conf.master.init().unwrap();
         let mut wm = WorkerManager::new(&conf).unwrap();
         heartbeat(&mut wm, HeartbeatStatus::Running, "old");
         wm
+    }
+
+    #[test]
+    fn zero_retention_does_not_schedule_graceful_cleanup_without_end() {
+        let mut wm = manager(Some("0s"));
+        assert!(wm
+            .claim_expired_departures(Instant::now() + Duration::from_secs(1000))
+            .is_empty());
+        assert!(wm.get_worker(100).is_some());
+
+        heartbeat(&mut wm, HeartbeatStatus::End, "old");
+        assert_eq!(wm.claim_expired_departures(Instant::now()).len(), 1);
     }
 
     #[test]
@@ -281,7 +293,7 @@ mod tests {
         let mut conf = ClusterConf::format();
         conf.testing = true;
         conf.journal.enable = false;
-        conf.master.worker_departure_retention = Some("0s".into());
+        conf.master.worker_graceful_exit_block_location_retention = Some("0s".into());
         conf.master.init().unwrap();
         conf.master.meta_dir = Utils::test_sub_dir(format!("departure/meta-{}", Utils::uuid()));
         conf.journal.journal_dir =

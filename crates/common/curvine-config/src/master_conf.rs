@@ -80,11 +80,13 @@ pub struct MasterConf {
     #[serde(skip)]
     pub worker_lost_interval_unit: DurationUnit,
 
-    /// Retain locations after a graceful worker departure. Omit for unlimited
-    /// retention; "0s" makes cleanup eligible at the next worker check.
-    pub worker_departure_retention: Option<String>,
+    /// Retain block-location metadata after accepting End from the registered
+    /// worker session. Omit for unlimited retention; "0s" makes cleanup eligible
+    /// at the next worker check. Network errors or missed heartbeats do not start
+    /// this timer; worker_lost_interval still governs heartbeat-timeout cleanup.
+    pub worker_graceful_exit_block_location_retention: Option<String>,
     #[serde(skip)]
-    pub worker_departure_retention_unit: Option<DurationUnit>,
+    pub worker_graceful_exit_block_location_retention_unit: Option<DurationUnit>,
 
     // Audit log configuration.
     pub audit_logging_enabled: bool,
@@ -163,23 +165,27 @@ impl MasterConf {
 
         self.worker_lost_interval_unit = DurationUnit::from_str(&self.worker_lost_interval)?;
         if self
-            .worker_departure_retention
+            .worker_graceful_exit_block_location_retention
             .as_deref()
             .is_some_and(|value| value.trim().starts_with('-'))
         {
-            return err_box!("master.worker_departure_retention must not be negative");
+            return err_box!(
+                "master.worker_graceful_exit_block_location_retention must not be negative"
+            );
         }
-        self.worker_departure_retention_unit = self
-            .worker_departure_retention
+        self.worker_graceful_exit_block_location_retention_unit = self
+            .worker_graceful_exit_block_location_retention
             .as_deref()
             .map(DurationUnit::from_str)
             .transpose()?;
-        if let Some(duration) = &self.worker_departure_retention_unit {
+        if let Some(duration) = &self.worker_graceful_exit_block_location_retention_unit {
             if std::time::Instant::now()
                 .checked_add(std::time::Duration::from_millis(duration.as_millis()))
                 .is_none()
             {
-                return err_box!("master.worker_departure_retention is too large");
+                return err_box!(
+                    "master.worker_graceful_exit_block_location_retention is too large"
+                );
             }
         }
 
@@ -328,8 +334,8 @@ impl Default for MasterConf {
             worker_lost_interval: "10m".to_string(),
             worker_lost_interval_unit: Default::default(),
 
-            worker_departure_retention: None,
-            worker_departure_retention_unit: None,
+            worker_graceful_exit_block_location_retention: None,
+            worker_graceful_exit_block_location_retention_unit: None,
 
             audit_logging_enabled: true,
             audit_log: Default::default(),
@@ -387,26 +393,52 @@ mod departure_retention_tests {
     use super::*;
 
     #[test]
+    fn retention_toml_uses_graceful_exit_block_location_name() {
+        let mut conf: ClusterConf =
+            toml::from_str("[master]\nworker_graceful_exit_block_location_retention = \"0s\"")
+                .unwrap();
+        assert_eq!(
+            conf.master
+                .worker_graceful_exit_block_location_retention
+                .as_deref(),
+            Some("0s")
+        );
+        conf.master.init().unwrap();
+        assert_eq!(
+            conf.master
+                .worker_graceful_exit_block_location_retention_unit
+                .as_ref()
+                .unwrap()
+                .as_millis(),
+            0
+        );
+    }
+
+    #[test]
     fn retention_defaults_to_unlimited_and_accepts_zero_and_positive_durations() {
         let mut conf = MasterConf::default();
-        assert!(conf.worker_departure_retention_unit.is_none());
+        assert!(conf
+            .worker_graceful_exit_block_location_retention_unit
+            .is_none());
         for (value, millis) in [("0s", 0), ("5m", 300_000)] {
-            conf.worker_departure_retention = Some(value.into());
+            conf.worker_graceful_exit_block_location_retention = Some(value.into());
             conf.init().unwrap();
             assert_eq!(
-                conf.worker_departure_retention_unit
+                conf.worker_graceful_exit_block_location_retention_unit
                     .as_ref()
                     .unwrap()
                     .as_millis(),
                 millis
             );
         }
-        conf.worker_departure_retention = Some("invalid".into());
+        conf.worker_graceful_exit_block_location_retention = Some("invalid".into());
         assert!(conf.init().is_err());
-        conf.worker_departure_retention = Some("-1s".into());
+        conf.worker_graceful_exit_block_location_retention = Some("-1s".into());
         assert!(conf.init().is_err());
-        conf.worker_departure_retention = None;
+        conf.worker_graceful_exit_block_location_retention = None;
         conf.init().unwrap();
-        assert!(conf.worker_departure_retention_unit.is_none());
+        assert!(conf
+            .worker_graceful_exit_block_location_retention_unit
+            .is_none());
     }
 }
