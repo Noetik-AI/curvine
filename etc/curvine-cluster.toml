@@ -52,6 +52,13 @@ allow_stale_cache = true
 # master configuration
 [master]
 meta_dir = "testing/meta"
+# Retain block-location metadata after the master accepts a graceful End
+# heartbeat from the registered worker session; omit for unlimited retention.
+# "0s" schedules cleanup at the next worker check; "5m" allows a rejoin window.
+# Departed workers are excluded from read locations throughout that window.
+# Network interruptions and missed heartbeats do not start this timer.
+# Prolonged heartbeat loss still uses the existing worker_lost_interval cleanup.
+# worker_graceful_exit_block_location_retention = "0s"
 # Worker selection policy: local, robin, random, load_based, or weighted.
 # local prefers a local worker for the first replica and assigns the rest via the weighted policy.
 # worker_policy = "weighted"

@@ -74,4 +74,5 @@ parking_lot = { workspace = true }
 
 [dev-dependencies]
 curvine-fault = { workspace = true, features = ["http-client"] }
+curvine-unified-fs = { workspace = true, features = ["opendal-s3"] }
 raft = { workspace = true }

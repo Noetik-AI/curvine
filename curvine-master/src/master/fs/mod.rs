@@ -13,6 +13,7 @@
 // limitations under the License.
 
 mod worker_manager;
+mod worker_retention;
 pub use self::worker_manager::WorkerManager;
 
 mod heartbeat_checker;
@@ -28,7 +29,6 @@ mod fs_retry_cache;
 pub use self::fs_retry_cache::*;
 
 mod master_filesystem;
-pub(crate) use self::master_filesystem::BlockInodeState;
 pub use self::master_filesystem::{BlockReportResult, MasterFilesystem};
 
 mod delete_result;

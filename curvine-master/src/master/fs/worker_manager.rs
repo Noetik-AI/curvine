@@ -14,6 +14,7 @@
 
 use crate::master::fs::policy::{ChooseContext, WorkerPolicyAdapter};
 use crate::master::fs::state::{BlockMap, WorkerMap};
+use crate::master::fs::worker_retention::WorkerDeparture;
 use crate::master::fs::DeleteResult;
 use curvine_config::ClusterConf;
 use curvine_core_error::{err_box, CommonResult};
@@ -25,8 +26,9 @@ use curvine_model::{
 use curvine_proto::ComponentInfoProto;
 use curvine_runtime::common::{ByteUnit, LocalTime};
 use log::{info, warn};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{Display, Formatter};
+use std::time::{Duration, Instant};
 
 pub struct WorkerManager {
     pub(crate) worker_map: WorkerMap,
@@ -34,6 +36,9 @@ pub struct WorkerManager {
     pub(crate) worker_policy: WorkerPolicyAdapter,
     pub(crate) cluster_id: String,
     pub(crate) conf: ClusterConf,
+    pub(crate) departures: HashMap<u32, WorkerDeparture>,
+    departure_generation: u64,
+    departed_sessions: HashMap<u32, String>,
 }
 
 impl WorkerManager {
@@ -46,6 +51,9 @@ impl WorkerManager {
             worker_policy,
             cluster_id: conf.cluster_id.to_string(),
             conf: conf.clone(),
+            departures: HashMap::new(),
+            departure_generation: 0,
+            departed_sessions: HashMap::new(),
         })
     }
 
@@ -88,18 +96,84 @@ impl WorkerManager {
                 // Same node restarting: clear the slot so we do not treat it as ready or run
                 // Running heartbeat bookkeeping until insert() on the next Running beat.
                 self.worker_map.remove(&addr);
+                self.departures.remove(&addr.worker_id);
+                self.departed_sessions.remove(&addr.worker_id);
+                if self
+                    .conf
+                    .master
+                    .worker_graceful_exit_block_location_retention_unit
+                    .is_some()
+                {
+                    // Start precedes inventory reporting. Supersede any old
+                    // cleanup, but do not retain forever if startup never
+                    // reaches its first Running heartbeat.
+                    self.departure_generation += 1;
+                    let mut state = WorkerDeparture::new(
+                        self.departure_generation,
+                        Instant::now()
+                            + Duration::from_millis(self.conf.master.worker_lost_interval_ms()),
+                    );
+                    state.starting_session = Some(worker_session_id);
+                    self.departures.insert(addr.worker_id, state);
+                }
                 return Ok(vec![]);
             }
 
-            HeartbeatStatus::Running => self.block_map.handle_heartbeat(addr.worker_id),
+            HeartbeatStatus::Running => {
+                // A Running RPC queued before End must not resurrect the
+                // departed process. A new Start (or new session) can rejoin.
+                if self.departed_sessions.get(&addr.worker_id) == Some(&worker_session_id) {
+                    return Ok(vec![]);
+                }
+                if self
+                    .departures
+                    .get(&addr.worker_id)
+                    .and_then(|state| state.starting_session.as_ref())
+                    .is_some_and(|session| session != &worker_session_id)
+                {
+                    return Ok(vec![]);
+                }
+                self.block_map.handle_heartbeat(addr.worker_id)
+            }
 
             HeartbeatStatus::End => {
+                // End can arrive after a restart. Only the registered session
+                // may retire its locations or schedule their deletion.
+                let Some(worker) = self.get_worker(addr.worker_id) else {
+                    return Ok(vec![]);
+                };
+                if !worker.address.same_endpoint(&addr)
+                    || worker.worker_session_id != worker_session_id
+                {
+                    warn!(
+                        "Ignore stale worker unregister: {}, session {}",
+                        addr, worker_session_id
+                    );
+                    return Ok(vec![]);
+                }
                 info!("Worker unregister: {}", addr);
                 let _ = self.worker_map.remove_offline(addr.worker_id);
+                self.departed_sessions
+                    .insert(addr.worker_id, worker_session_id);
+                if let Some(retention) = &self
+                    .conf
+                    .master
+                    .worker_graceful_exit_block_location_retention_unit
+                {
+                    self.departure_generation += 1;
+                    self.departures.insert(
+                        addr.worker_id,
+                        WorkerDeparture::new(
+                            self.departure_generation,
+                            Instant::now() + Duration::from_millis(retention.as_millis()),
+                        ),
+                    );
+                }
                 return Ok(vec![]);
             }
         };
 
+        let worker_id = addr.worker_id;
         self.worker_map.insert(
             addr,
             weight,
@@ -110,6 +184,8 @@ impl WorkerManager {
             storages,
             component_info,
         )?;
+        self.departures.remove(&worker_id);
+        self.departed_sessions.remove(&worker_id);
         self.expire_scheduled_bytes();
         Ok(cmds)
     }

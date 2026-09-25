@@ -22,6 +22,7 @@ use curvine_runtime::common::{LocalTime, TimeSpent};
 use curvine_runtime::runtime::{GroupExecutor, LoopTask};
 use log::{error, info, warn};
 use std::sync::Arc;
+use std::time::Instant;
 
 pub struct HeartbeatChecker {
     fs: MasterFilesystem,
@@ -127,6 +128,48 @@ impl LoopTask for HeartbeatChecker {
             });
             if let Err(e) = &res {
                 warn!("{}", e);
+            }
+        }
+
+        let departures = self
+            .fs
+            .worker_manager
+            .write()
+            .claim_expired_departures(Instant::now());
+        for (id, generation) in departures {
+            let fs = self.fs.clone();
+            let rm = self.replication_manager.clone();
+            let monitor = self.monitor.clone();
+            let result = self.executor.spawn(move || {
+                let result = (|| -> FsResult<()> {
+                    fs.prepare_departure_cleanup(id, generation)?;
+                    while monitor.is_active() {
+                        let Some(blocks) = fs.clean_departure_batch(id, generation)? else {
+                            break;
+                        };
+                        if !blocks.is_empty() {
+                            rm.report_under_replicated_blocks(id, blocks)?;
+                        }
+                    }
+                    Ok(())
+                })();
+                fs.worker_manager.write().release_departure(id, generation);
+                if let Err(error) = result {
+                    warn!(
+                        "Graceful worker {} cleanup failed; will retry: {}",
+                        id, error
+                    );
+                }
+            });
+            if let Err(error) = result {
+                self.fs
+                    .worker_manager
+                    .write()
+                    .release_departure(id, generation);
+                warn!(
+                    "Cannot schedule graceful worker {} cleanup; will retry: {}",
+                    id, error
+                );
             }
         }
 
