@@ -800,6 +800,11 @@ impl MasterHandler {
     ) -> FsResult<Vec<WorkerCommand>> {
         let worker_id = header.worker_id;
         let worker_session_id = header.worker_session_id.clone().unwrap_or_default();
+        if fs.conf.worker_end_cleanup_enabled && worker_session_id.is_empty() {
+            return err_box!(
+                "worker_session_id is required when master.worker_end_cleanup_enabled is true"
+            );
+        }
         let lifecycle_lock = fs.worker_lifecycle_lock(worker_id);
         let _lifecycle_guard = lifecycle_lock.lock();
         let report_is_current = fs
@@ -1284,6 +1289,35 @@ mod tests {
         // Structured version metadata survives heartbeat -> WorkerInfo ->
         // WorkerInfoProto (filesystem_info) -> WorkerInfo round trip.
         assert_eq!(worker.component_info, Some(component_info));
+    }
+
+    #[test]
+    fn process_block_report_requires_session_when_end_cleanup_is_enabled() {
+        Master::init_test_metrics();
+        let test_name = Utils::rand_str(6);
+        let mut conf = ClusterConf::format();
+        conf.testing = true;
+        conf.journal.enable = false;
+        conf.master.worker_end_cleanup_enabled = true;
+        conf.master.meta_dir = Utils::test_sub_dir(format!("master-handler-test/meta-{test_name}"));
+        conf.journal.journal_dir =
+            Utils::test_sub_dir(format!("master-handler-test/journal-{test_name}"));
+        let fs = JournalSystem::fs_only_for_test(&conf).unwrap();
+
+        let result = MasterHandler::process_block_report(
+            fs,
+            None,
+            BlockReportListRequest {
+                worker_id: 7,
+                ..Default::default()
+            },
+        );
+
+        let error = match result {
+            Ok(_) => panic!("legacy block report should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("worker_session_id is required"));
     }
 
     #[test]

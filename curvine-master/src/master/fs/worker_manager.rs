@@ -229,7 +229,8 @@ impl WorkerManager {
             }
             let tracked_session_id = session.session_id.clone();
             if matches && self.is_recoverable_timeout_session(worker_id, &tracked_session_id) {
-                self.start_worker_session(worker_id, tracked_session_id);
+                // Accept the report, but keep the timeout cleanup generation armed until
+                // a Running heartbeat restores the worker to the live map.
                 return true;
             }
             return false;
@@ -1072,6 +1073,20 @@ mod tests {
 
         assert!(manager.get_worker(7).is_some());
         assert!(!manager.is_cleanup_current(cleanup_token));
+    }
+
+    #[test]
+    fn timeout_block_report_keeps_cleanup_armed_until_running_heartbeat() {
+        let mut manager = robin_manager();
+        manager.conf.master.worker_end_cleanup_enabled = true;
+        let mut worker = worker_with_available(7, 100);
+        worker.worker_session_id = "timed-out-session".to_string();
+        manager.add_test_worker(worker);
+
+        let (_, cleanup_token) = manager.remove_expired_worker(7).unwrap();
+        assert!(manager.accept_block_report_session(7, "timed-out-session"));
+        assert!(manager.is_cleanup_current(cleanup_token));
+        assert!(manager.get_worker(7).is_none());
     }
 
     #[test]
