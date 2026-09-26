@@ -28,6 +28,10 @@ use log::{info, warn};
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 
+// Bound the generation window that rejects late messages from processes which
+// ended before they ever reached the registered worker map.
+const MAX_COMPLETED_WORKER_SESSION_TOMBSTONES: usize = 1024;
+
 pub struct WorkerManager {
     pub(crate) worker_map: WorkerMap,
     pub(crate) block_map: BlockMap,
@@ -55,6 +59,8 @@ struct WorkerSessionState {
     session_id: String,
     generation: u64,
     ended: bool,
+    cleanup_pending: bool,
+    retain_after_cleanup: bool,
 }
 
 #[derive(Default)]
@@ -96,6 +102,8 @@ impl WorkerManager {
                 session_id,
                 generation,
                 ended: false,
+                cleanup_pending: false,
+                retain_after_cleanup: false,
             },
         );
     }
@@ -162,11 +170,26 @@ impl WorkerManager {
             return None;
         }
 
-        if let Some(session) = self.worker_sessions.get_mut(&worker_id) {
-            if session.ended || session.session_id != session_id {
+        if let Some(session) = self.worker_sessions.get(&worker_id) {
+            if session.session_id != session_id {
                 return None;
             }
+            if session.ended {
+                // A timeout is recoverable until the same process explicitly
+                // announces End. Reuse the queued timeout cleanup generation so
+                // a late Running heartbeat can no longer fence it.
+                return self
+                    .is_recoverable_timeout_session(worker_id, session_id)
+                    .then_some(WorkerCleanupToken {
+                        worker_id,
+                        generation: session.generation,
+                    });
+            }
+        }
+
+        if let Some(session) = self.worker_sessions.get_mut(&worker_id) {
             session.ended = true;
+            session.cleanup_pending = true;
             return Some(WorkerCleanupToken {
                 worker_id,
                 generation: session.generation,
@@ -180,7 +203,8 @@ impl WorkerManager {
             .get(&worker_id)
             .map(|worker| worker.worker_session_id == session_id)
             .unwrap_or(false);
-        if !registered_matches {
+        let timed_out_matches = self.is_recoverable_timeout_session(worker_id, session_id);
+        if !registered_matches && !timed_out_matches {
             return None;
         }
 
@@ -191,6 +215,8 @@ impl WorkerManager {
                 session_id: session_id.to_string(),
                 generation,
                 ended: true,
+                cleanup_pending: true,
+                retain_after_cleanup: false,
             },
         );
         Some(WorkerCleanupToken {
@@ -202,14 +228,58 @@ impl WorkerManager {
     pub fn is_cleanup_current(&self, token: WorkerCleanupToken) -> bool {
         self.worker_sessions
             .get(&token.worker_id)
-            .map(|session| session.ended && session.generation == token.generation)
+            .map(|session| {
+                session.ended && session.cleanup_pending && session.generation == token.generation
+            })
             .unwrap_or(false)
+    }
+
+    fn retain_cleanup_tombstone(&mut self, token: WorkerCleanupToken) {
+        if let Some(session) = self.worker_sessions.get_mut(&token.worker_id) {
+            if session.generation == token.generation {
+                session.retain_after_cleanup = true;
+            }
+        }
+    }
+
+    fn prune_completed_worker_session_tombstones(&mut self) {
+        let mut completed = self
+            .worker_sessions
+            .iter()
+            .filter(|(_, session)| {
+                session.ended && !session.cleanup_pending && session.retain_after_cleanup
+            })
+            .map(|(worker_id, session)| (session.generation, *worker_id))
+            .collect::<Vec<_>>();
+        if completed.len() <= MAX_COMPLETED_WORKER_SESSION_TOMBSTONES {
+            return;
+        }
+
+        completed.sort_unstable();
+        let remove_count = completed.len() - MAX_COMPLETED_WORKER_SESSION_TOMBSTONES;
+        for (_, worker_id) in completed.into_iter().take(remove_count) {
+            self.worker_sessions.remove(&worker_id);
+        }
     }
 
     /// Retire an ended session after its one cleanup attempt. The generation
     /// check prevents a delayed cleanup from removing a replacement session.
     pub fn finish_cleanup(&mut self, token: WorkerCleanupToken) {
-        if self.is_cleanup_current(token) {
+        if !self.is_cleanup_current(token) {
+            return;
+        }
+
+        let retain_after_cleanup = self
+            .worker_sessions
+            .get(&token.worker_id)
+            .map(|session| session.retain_after_cleanup)
+            .unwrap_or(false);
+        if retain_after_cleanup {
+            if let Some(session) = self.worker_sessions.get_mut(&token.worker_id) {
+                session.cleanup_pending = false;
+            }
+            self.prune_completed_worker_session_tombstones();
+        } else {
             self.worker_sessions.remove(&token.worker_id);
         }
     }
@@ -321,21 +391,24 @@ impl WorkerManager {
             HeartbeatStatus::End => {
                 info!("Worker unregister: {}", addr);
                 let cleanup_token = self.end_worker_session(addr.worker_id, &worker_session_id);
-                if cleanup_token.is_some() {
+                if let Some(token) = cleanup_token {
                     // Validate the process session before mutating registration state. During
                     // Start-to-Running there is intentionally no registered worker, but the
                     // lifecycle tracker still makes the matching End eligible for cleanup.
                     if self.worker_map.workers.contains_key(&addr.worker_id) {
                         let _ = self.worker_map.remove_offline(addr.worker_id);
+                    } else if let Some(worker) =
+                        self.worker_map.lost_workers.get_mut(&addr.worker_id)
+                    {
+                        // A matching End makes a heartbeat timeout terminal. Keep
+                        // the existing lost-worker record but prevent Running from
+                        // treating it as a recoverable timeout.
+                        worker.status = WorkerStatus::Unknown;
                     } else {
-                        // Preserve an explicit-End marker through cleanup even if the
-                        // worker exits during the Start-to-Running registration gap.
-                        let mut ended_worker = WorkerInfo::new(addr.clone(), weight);
-                        ended_worker.worker_session_id = worker_session_id.clone();
-                        ended_worker.status = WorkerStatus::Unknown;
-                        self.worker_map
-                            .lost_workers
-                            .insert(addr.worker_id, ended_worker);
+                        // Preserve a bounded lifecycle tombstone when End arrives in
+                        // the Start-to-Running gap. It fences late messages without
+                        // growing lost_workers for processes that never registered.
+                        self.retain_cleanup_tombstone(token);
                     }
                 } else {
                     warn!(
@@ -470,6 +543,8 @@ impl WorkerManager {
                         session_id: worker.worker_session_id.clone(),
                         generation,
                         ended: true,
+                        cleanup_pending: true,
+                        retain_after_cleanup: false,
                     },
                 );
                 WorkerCleanupToken {
@@ -803,6 +878,7 @@ mod tests {
 
         let cleanup_token = result.cleanup_token.unwrap();
         assert_eq!(cleanup_token.worker_id(), 7);
+        assert!(manager.worker_map.lost_workers.get(&7).is_none());
 
         manager
             .heartbeat(
@@ -843,6 +919,28 @@ mod tests {
             )
             .unwrap();
         assert!(manager.get_worker(7).is_none());
+    }
+
+    #[test]
+    fn completed_start_gap_tombstones_are_bounded() {
+        let mut manager = robin_manager();
+
+        for worker_id in 0..=(MAX_COMPLETED_WORKER_SESSION_TOMBSTONES as u32) {
+            let session_id = format!("session-{worker_id}");
+            manager.start_worker_session(worker_id, session_id.clone());
+            let cleanup_token = manager.end_worker_session(worker_id, &session_id).unwrap();
+            manager.retain_cleanup_tombstone(cleanup_token);
+            manager.finish_cleanup(cleanup_token);
+        }
+
+        assert_eq!(
+            manager.worker_sessions.len(),
+            MAX_COMPLETED_WORKER_SESSION_TOMBSTONES
+        );
+        assert!(!manager.worker_sessions.contains_key(&0));
+        assert!(manager
+            .worker_sessions
+            .contains_key(&(MAX_COMPLETED_WORKER_SESSION_TOMBSTONES as u32)));
     }
 
     #[test]
@@ -1073,6 +1171,60 @@ mod tests {
 
         assert!(manager.get_worker(7).is_some());
         assert!(!manager.is_cleanup_current(cleanup_token));
+    }
+
+    #[test]
+    fn end_heartbeat_makes_timed_out_worker_terminal() {
+        let mut manager = robin_manager();
+        let mut worker = worker_with_available(7, 100);
+        worker.worker_session_id = "timed-out-session".to_string();
+        let addr = worker.address.clone();
+        manager.add_test_worker(worker);
+        let cluster_id = manager.cluster_id.clone();
+
+        let (_, timeout_cleanup_token) = manager.remove_expired_worker(7).unwrap();
+        assert_eq!(
+            manager.worker_map.lost_workers.get(&7).unwrap().status,
+            WorkerStatus::Lost
+        );
+
+        let end_cleanup_token = manager
+            .heartbeat(
+                &cluster_id,
+                HeartbeatStatus::End,
+                addr.clone(),
+                1,
+                "timed-out-session".to_string(),
+                TransferWorkerCapabilities::default(),
+                String::new(),
+                0,
+                vec![],
+                None,
+            )
+            .unwrap()
+            .cleanup_token;
+        assert_eq!(end_cleanup_token, Some(timeout_cleanup_token));
+        assert_eq!(
+            manager.worker_map.lost_workers.get(&7).unwrap().status,
+            WorkerStatus::Unknown
+        );
+
+        manager
+            .heartbeat(
+                &cluster_id,
+                HeartbeatStatus::Running,
+                addr,
+                1,
+                "timed-out-session".to_string(),
+                TransferWorkerCapabilities::default(),
+                String::new(),
+                0,
+                vec![],
+                None,
+            )
+            .unwrap();
+        assert!(manager.get_worker(7).is_none());
+        assert!(manager.is_cleanup_current(timeout_cleanup_token));
     }
 
     #[test]
