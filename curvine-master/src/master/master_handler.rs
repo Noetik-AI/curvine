@@ -1426,6 +1426,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(fs.pending_full_block_report_len(address.worker_id), Some(1));
+        assert!(fs
+            .worker_manager
+            .read()
+            .get_worker(address.worker_id)
+            .is_none());
         assert!(
             fs.worker_manager
                 .write()

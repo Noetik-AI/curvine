@@ -59,6 +59,7 @@ struct WorkerSessionState {
     session_id: String,
     startup_time_ms: u64,
     generation: u64,
+    reconstructed_from_running: bool,
     ended: bool,
     cleanup_pending: bool,
     retain_after_cleanup: bool,
@@ -119,12 +120,25 @@ impl WorkerManager {
                 session_id,
                 startup_time_ms,
                 generation,
+                reconstructed_from_running: false,
                 ended: false,
                 cleanup_pending: false,
                 retain_after_cleanup: false,
                 unverified_end_since_ms: None,
             },
         );
+    }
+
+    fn reconstruct_worker_session(
+        &mut self,
+        worker_id: u32,
+        session_id: String,
+        startup_time_ms: u64,
+    ) {
+        self.start_worker_session(worker_id, session_id, startup_time_ms);
+        if let Some(session) = self.worker_sessions.get_mut(&worker_id) {
+            session.reconstructed_from_running = true;
+        }
     }
 
     fn accept_running_session(
@@ -139,9 +153,10 @@ impl WorkerManager {
                 session.session_id == session_id,
                 session.startup_time_ms,
                 session.unverified_end_since_ms.is_some(),
+                session.reconstructed_from_running,
             )
         }) {
-            Some((false, true, tracked_startup_time_ms, _)) => {
+            Some((false, true, tracked_startup_time_ms, _, _)) => {
                 if tracked_startup_time_ms == 0 && startup_time_ms != 0 {
                     if let Some(session) = self.worker_sessions.get_mut(&worker_id) {
                         session.startup_time_ms = startup_time_ms;
@@ -149,16 +164,16 @@ impl WorkerManager {
                 }
                 true
             }
-            Some((false, false, tracked_startup_time_ms, _))
+            Some((false, false, tracked_startup_time_ms, _, true))
                 if startup_time_ms > tracked_startup_time_ms =>
             {
                 // A fresh leader may first reconstruct an older process from a
                 // delayed Running heartbeat. Let a provably newer process replace it.
-                self.start_worker_session(worker_id, session_id.to_string(), startup_time_ms);
+                self.reconstruct_worker_session(worker_id, session_id.to_string(), startup_time_ms);
                 true
             }
-            Some((false, false, _, _)) => false,
-            Some((true, true, _, _))
+            Some((false, false, _, _, _)) => false,
+            Some((true, true, _, _, _))
                 if self.is_recoverable_timeout_session(worker_id, session_id) =>
             {
                 // Preserve the pre-existing behavior where a worker can rejoin after a
@@ -166,13 +181,13 @@ impl WorkerManager {
                 self.start_worker_session(worker_id, session_id.to_string(), startup_time_ms);
                 true
             }
-            Some((true, false, ended_startup_time_ms, true))
+            Some((true, false, ended_startup_time_ms, true, _))
                 if startup_time_ms > ended_startup_time_ms =>
             {
                 // An End first seen after failover is held for one lost-worker
                 // interval. A newer process can prove the End was stale before
                 // destructive cleanup begins.
-                self.start_worker_session(worker_id, session_id.to_string(), startup_time_ms);
+                self.reconstruct_worker_session(worker_id, session_id.to_string(), startup_time_ms);
                 true
             }
             Some(_) => false,
@@ -194,7 +209,11 @@ impl WorkerManager {
                             None => (session_id.to_string(), startup_time_ms),
                         },
                     };
-                self.start_worker_session(worker_id, tracked_session_id, tracked_startup_time_ms);
+                self.reconstruct_worker_session(
+                    worker_id,
+                    tracked_session_id,
+                    tracked_startup_time_ms,
+                );
                 true
             }
         }
@@ -287,6 +306,7 @@ impl WorkerManager {
                 session_id: session_id.to_string(),
                 startup_time_ms: tracked_startup_time_ms,
                 generation,
+                reconstructed_from_running: false,
                 ended: true,
                 cleanup_pending: !untracked_failover_end,
                 retain_after_cleanup: untracked_failover_end,
@@ -399,34 +419,57 @@ impl WorkerManager {
             return Default::default();
         }
 
-        if let Some((ended, matches, tracked_startup_time_ms, unverified_end)) =
-            self.worker_sessions.get(&worker_id).map(|session| {
-                (
-                    session.ended,
-                    session_id.is_empty() || session.session_id == session_id,
-                    session.startup_time_ms,
-                    session.unverified_end_since_ms.is_some(),
-                )
-            })
-        {
+        if let Some((
+            ended,
+            matches,
+            tracked_startup_time_ms,
+            unverified_end,
+            reconstructed_from_running,
+        )) = self.worker_sessions.get(&worker_id).map(|session| {
+            (
+                session.ended,
+                session_id.is_empty() || session.session_id == session_id,
+                session.startup_time_ms,
+                session.unverified_end_since_ms.is_some(),
+                session.reconstructed_from_running,
+            )
+        }) {
+            let tracked_session_id = self
+                .worker_sessions
+                .get(&worker_id)
+                .map(|session| session.session_id.clone())
+                .unwrap_or_default();
+            let recoverable_reconstructed_timeout = ended
+                && reconstructed_from_running
+                && self.is_recoverable_timeout_session(worker_id, &tracked_session_id);
             if !ended && matches {
                 return BlockReportSessionResult {
                     accepted: true,
                     reset_full_report: false,
                 };
             }
-            if !matches && (!ended || unverified_end) && startup_time_ms > tracked_startup_time_ms {
+            if !matches
+                && ((!ended && reconstructed_from_running)
+                    || unverified_end
+                    || recoverable_reconstructed_timeout)
+                && startup_time_ms > tracked_startup_time_ms
+            {
+                if !ended {
+                    if let Some(address) = self
+                        .worker_map
+                        .workers
+                        .get(&worker_id)
+                        .map(|worker| worker.address.clone())
+                    {
+                        self.worker_map.remove(&address);
+                    }
+                }
                 self.start_worker_session(worker_id, session_id.to_string(), startup_time_ms);
                 return BlockReportSessionResult {
                     accepted: true,
                     reset_full_report: true,
                 };
             }
-            let tracked_session_id = self
-                .worker_sessions
-                .get(&worker_id)
-                .map(|session| session.session_id.clone())
-                .unwrap_or_default();
             if matches && self.is_recoverable_timeout_session(worker_id, &tracked_session_id) {
                 // Accept the report, but keep the timeout cleanup generation armed until
                 // a Running heartbeat restores the worker to the live map.
@@ -441,41 +484,30 @@ impl WorkerManager {
         // A new leader may receive the startup full report before the first
         // Running heartbeat. Establish that session from the report, recover a
         // matching heartbeat-timeout worker, but never revive an explicit End.
-        let (tracked_session_id, tracked_startup_time_ms, reset_full_report) = match self
+        let (tracked_session_id, tracked_startup_time_ms) = match self
             .worker_map
             .workers
             .get(&worker_id)
         {
             Some(worker) if !session_id.is_empty() && worker.worker_session_id != session_id => {
-                if startup_time_ms <= worker.startup_time_ms {
-                    return Default::default();
-                }
-                (session_id.to_string(), startup_time_ms, true)
+                return Default::default();
             }
-            Some(worker) => (
-                worker.worker_session_id.clone(),
-                worker.startup_time_ms,
-                false,
-            ),
+            Some(worker) => (worker.worker_session_id.clone(), worker.startup_time_ms),
             None => match self.worker_map.lost_workers.get(&worker_id) {
                 Some(worker)
                     if worker.status == WorkerStatus::Lost
                         && (session_id.is_empty() || worker.worker_session_id == session_id) =>
                 {
-                    (
-                        worker.worker_session_id.clone(),
-                        worker.startup_time_ms,
-                        false,
-                    )
+                    (worker.worker_session_id.clone(), worker.startup_time_ms)
                 }
                 Some(_) => return Default::default(),
-                None => (session_id.to_string(), startup_time_ms, false),
+                None => (session_id.to_string(), startup_time_ms),
             },
         };
         self.start_worker_session(worker_id, tracked_session_id, tracked_startup_time_ms);
         BlockReportSessionResult {
             accepted: true,
-            reset_full_report,
+            reset_full_report: false,
         }
     }
 
@@ -751,6 +783,7 @@ impl WorkerManager {
                         session_id: worker.worker_session_id.clone(),
                         startup_time_ms: worker.startup_time_ms,
                         generation,
+                        reconstructed_from_running: false,
                         ended: true,
                         cleanup_pending: true,
                         retain_after_cleanup: false,
@@ -1652,11 +1685,63 @@ mod tests {
         let report_result = manager.accept_block_report_session(7, "replacement-session", 200);
         assert!(report_result.accepted);
         assert!(report_result.reset_full_report);
+        assert!(manager.get_worker(7).is_none());
         assert!(
             !manager
                 .accept_block_report_session(7, "stale-session", 100)
                 .accepted
         );
+
+        manager
+            .heartbeat(
+                &cluster_id,
+                HeartbeatStatus::Running,
+                addr,
+                1,
+                "replacement-session".to_string(),
+                TransferWorkerCapabilities::default(),
+                String::new(),
+                200,
+                vec![],
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            manager.get_worker(7).unwrap().worker_session_id,
+            "replacement-session"
+        );
+    }
+
+    #[test]
+    fn newer_startup_report_fences_reconstructed_timeout_cleanup() {
+        let mut manager = robin_manager();
+        manager.conf.master.worker_end_cleanup_enabled = true;
+        let cluster_id = manager.cluster_id.clone();
+        let addr = WorkerAddress {
+            worker_id: 7,
+            ..Default::default()
+        };
+
+        manager
+            .heartbeat(
+                &cluster_id,
+                HeartbeatStatus::Running,
+                addr.clone(),
+                1,
+                "stale-session".to_string(),
+                TransferWorkerCapabilities::default(),
+                String::new(),
+                100,
+                vec![],
+                None,
+            )
+            .unwrap();
+        let (_, cleanup_token) = manager.remove_expired_worker(7).unwrap();
+
+        let report_result = manager.accept_block_report_session(7, "replacement-session", 200);
+        assert!(report_result.accepted);
+        assert!(report_result.reset_full_report);
+        assert!(!manager.is_cleanup_current(cleanup_token));
 
         manager
             .heartbeat(
