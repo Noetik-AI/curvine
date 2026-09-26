@@ -82,6 +82,12 @@ pub struct WorkerHeartbeatResult {
     pub reset_full_report: bool,
 }
 
+#[derive(Default)]
+pub struct BlockReportSessionResult {
+    pub accepted: bool,
+    pub reset_full_report: bool,
+}
+
 impl WorkerManager {
     pub fn new(conf: &ClusterConf) -> FsResult<Self> {
         let worker_policy = WorkerPolicyAdapter::from_conf(conf)?;
@@ -385,53 +391,92 @@ impl WorkerManager {
         worker_id: u32,
         session_id: &str,
         startup_time_ms: u64,
-    ) -> bool {
+    ) -> BlockReportSessionResult {
         if session_id.is_empty() && self.conf.master.worker_end_cleanup_enabled {
             // A legacy report cannot be fenced across an End/replacement boundary.
             // Enabling End cleanup therefore requires upgraded workers that attach
             // their process session to block reports.
-            return false;
+            return Default::default();
         }
 
-        if let Some(session) = self.worker_sessions.get(&worker_id) {
-            let matches = session_id.is_empty() || session.session_id == session_id;
-            if !session.ended {
-                return matches;
+        if let Some((ended, matches, tracked_startup_time_ms, unverified_end)) =
+            self.worker_sessions.get(&worker_id).map(|session| {
+                (
+                    session.ended,
+                    session_id.is_empty() || session.session_id == session_id,
+                    session.startup_time_ms,
+                    session.unverified_end_since_ms.is_some(),
+                )
+            })
+        {
+            if !ended && matches {
+                return BlockReportSessionResult {
+                    accepted: true,
+                    reset_full_report: false,
+                };
             }
-            let tracked_session_id = session.session_id.clone();
+            if !matches && (!ended || unverified_end) && startup_time_ms > tracked_startup_time_ms {
+                self.start_worker_session(worker_id, session_id.to_string(), startup_time_ms);
+                return BlockReportSessionResult {
+                    accepted: true,
+                    reset_full_report: true,
+                };
+            }
+            let tracked_session_id = self
+                .worker_sessions
+                .get(&worker_id)
+                .map(|session| session.session_id.clone())
+                .unwrap_or_default();
             if matches && self.is_recoverable_timeout_session(worker_id, &tracked_session_id) {
                 // Accept the report, but keep the timeout cleanup generation armed until
                 // a Running heartbeat restores the worker to the live map.
-                return true;
+                return BlockReportSessionResult {
+                    accepted: true,
+                    reset_full_report: false,
+                };
             }
-            return false;
+            return Default::default();
         }
 
         // A new leader may receive the startup full report before the first
         // Running heartbeat. Establish that session from the report, recover a
         // matching heartbeat-timeout worker, but never revive an explicit End.
-        let (tracked_session_id, tracked_startup_time_ms) = match self
+        let (tracked_session_id, tracked_startup_time_ms, reset_full_report) = match self
             .worker_map
             .workers
             .get(&worker_id)
         {
             Some(worker) if !session_id.is_empty() && worker.worker_session_id != session_id => {
-                return false;
+                if startup_time_ms <= worker.startup_time_ms {
+                    return Default::default();
+                }
+                (session_id.to_string(), startup_time_ms, true)
             }
-            Some(worker) => (worker.worker_session_id.clone(), worker.startup_time_ms),
+            Some(worker) => (
+                worker.worker_session_id.clone(),
+                worker.startup_time_ms,
+                false,
+            ),
             None => match self.worker_map.lost_workers.get(&worker_id) {
                 Some(worker)
                     if worker.status == WorkerStatus::Lost
                         && (session_id.is_empty() || worker.worker_session_id == session_id) =>
                 {
-                    (worker.worker_session_id.clone(), worker.startup_time_ms)
+                    (
+                        worker.worker_session_id.clone(),
+                        worker.startup_time_ms,
+                        false,
+                    )
                 }
-                Some(_) => return false,
-                None => (session_id.to_string(), startup_time_ms),
+                Some(_) => return Default::default(),
+                None => (session_id.to_string(), startup_time_ms, false),
             },
         };
         self.start_worker_session(worker_id, tracked_session_id, tracked_startup_time_ms);
-        true
+        BlockReportSessionResult {
+            accepted: true,
+            reset_full_report,
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1265,7 +1310,11 @@ mod tests {
             )
             .unwrap();
 
-        assert!(manager.accept_block_report_session(7, "replacement-session", 0));
+        assert!(
+            manager
+                .accept_block_report_session(7, "replacement-session", 0)
+                .accepted
+        );
         manager
             .heartbeat(
                 &cluster_id,
@@ -1323,8 +1372,12 @@ mod tests {
         let addr = worker.address.clone();
         manager.add_test_worker(worker);
         let cluster_id = manager.cluster_id.clone();
-        assert!(manager.accept_block_report_session(7, "ended-session", 0));
-        assert!(!manager.accept_block_report_session(7, "", 0));
+        assert!(
+            manager
+                .accept_block_report_session(7, "ended-session", 0)
+                .accepted
+        );
+        assert!(!manager.accept_block_report_session(7, "", 0).accepted);
 
         let cleanup_token = manager
             .heartbeat(
@@ -1343,7 +1396,11 @@ mod tests {
             .cleanup_token
             .unwrap();
         assert!(manager.is_cleanup_current(cleanup_token));
-        assert!(!manager.accept_block_report_session(7, "ended-session", 0));
+        assert!(
+            !manager
+                .accept_block_report_session(7, "ended-session", 0)
+                .accepted
+        );
 
         manager
             .heartbeat(
@@ -1361,12 +1418,24 @@ mod tests {
             .unwrap();
 
         assert!(!manager.is_cleanup_current(cleanup_token));
-        assert!(!manager.accept_block_report_session(7, "ended-session", 0));
-        assert!(!manager.accept_block_report_session(7, "", 0));
-        assert!(manager.accept_block_report_session(7, "replacement-session", 0));
+        assert!(
+            !manager
+                .accept_block_report_session(7, "ended-session", 0)
+                .accepted
+        );
+        assert!(!manager.accept_block_report_session(7, "", 0).accepted);
+        assert!(
+            manager
+                .accept_block_report_session(7, "replacement-session", 0)
+                .accepted
+        );
 
         manager.finish_cleanup(cleanup_token);
-        assert!(manager.accept_block_report_session(7, "replacement-session", 0));
+        assert!(
+            manager
+                .accept_block_report_session(7, "replacement-session", 0)
+                .accepted
+        );
     }
 
     #[test]
@@ -1376,7 +1445,7 @@ mod tests {
         worker.worker_session_id = "current-session".to_string();
         manager.add_test_worker(worker);
 
-        assert!(manager.accept_block_report_session(7, "", 0));
+        assert!(manager.accept_block_report_session(7, "", 0).accepted);
     }
 
     #[test]
@@ -1433,8 +1502,12 @@ mod tests {
         manager.finish_cleanup(cleanup_token);
 
         assert!(!manager.is_cleanup_current(cleanup_token));
-        assert!(!manager.accept_block_report_session(7, "", 0));
-        assert!(!manager.accept_block_report_session(7, "ended-session", 0));
+        assert!(!manager.accept_block_report_session(7, "", 0).accepted);
+        assert!(
+            !manager
+                .accept_block_report_session(7, "ended-session", 0)
+                .accepted
+        );
         manager
             .heartbeat(
                 &cluster_id,
@@ -1462,8 +1535,16 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(manager.accept_block_report_session(7, "startup-session", 123));
-        assert!(!manager.accept_block_report_session(7, "other-session", 0));
+        assert!(
+            manager
+                .accept_block_report_session(7, "startup-session", 123)
+                .accepted
+        );
+        assert!(
+            !manager
+                .accept_block_report_session(7, "other-session", 0)
+                .accepted
+        );
 
         manager
             .heartbeat(
@@ -1495,7 +1576,11 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(manager.accept_block_report_session(7, "replacement-session", 200));
+        assert!(
+            manager
+                .accept_block_report_session(7, "replacement-session", 200)
+                .accepted
+        );
 
         let stale_result = manager
             .heartbeat(
@@ -1513,7 +1598,65 @@ mod tests {
             .unwrap();
         assert!(!stale_result.reset_full_report);
         assert!(manager.get_worker(7).is_none());
-        assert!(manager.accept_block_report_session(7, "replacement-session", 200));
+        assert!(
+            manager
+                .accept_block_report_session(7, "replacement-session", 200)
+                .accepted
+        );
+
+        manager
+            .heartbeat(
+                &cluster_id,
+                HeartbeatStatus::Running,
+                addr,
+                1,
+                "replacement-session".to_string(),
+                TransferWorkerCapabilities::default(),
+                String::new(),
+                200,
+                vec![],
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            manager.get_worker(7).unwrap().worker_session_id,
+            "replacement-session"
+        );
+    }
+
+    #[test]
+    fn newer_startup_report_replaces_failover_running_guess() {
+        let mut manager = robin_manager();
+        manager.conf.master.worker_end_cleanup_enabled = true;
+        let cluster_id = manager.cluster_id.clone();
+        let addr = WorkerAddress {
+            worker_id: 7,
+            ..Default::default()
+        };
+
+        manager
+            .heartbeat(
+                &cluster_id,
+                HeartbeatStatus::Running,
+                addr.clone(),
+                1,
+                "stale-session".to_string(),
+                TransferWorkerCapabilities::default(),
+                String::new(),
+                100,
+                vec![],
+                None,
+            )
+            .unwrap();
+
+        let report_result = manager.accept_block_report_session(7, "replacement-session", 200);
+        assert!(report_result.accepted);
+        assert!(report_result.reset_full_report);
+        assert!(
+            !manager
+                .accept_block_report_session(7, "stale-session", 100)
+                .accepted
+        );
 
         manager
             .heartbeat(
@@ -1654,8 +1797,16 @@ mod tests {
         );
 
         assert!(result.is_err());
-        assert!(manager.accept_block_report_session(7, "current-session", 0));
-        assert!(!manager.accept_block_report_session(7, "replacement-session", 0));
+        assert!(
+            manager
+                .accept_block_report_session(7, "current-session", 0)
+                .accepted
+        );
+        assert!(
+            !manager
+                .accept_block_report_session(7, "replacement-session", 0)
+                .accepted
+        );
         let worker = manager.get_worker(7).unwrap();
         assert_eq!(worker.address.hostname, current_addr.hostname);
         assert_eq!(worker.worker_session_id, "current-session");
@@ -1754,7 +1905,11 @@ mod tests {
         manager.add_test_worker(worker);
 
         let (_, cleanup_token) = manager.remove_expired_worker(7).unwrap();
-        assert!(manager.accept_block_report_session(7, "timed-out-session", 0));
+        assert!(
+            manager
+                .accept_block_report_session(7, "timed-out-session", 0)
+                .accepted
+        );
         assert!(manager.is_cleanup_current(cleanup_token));
         assert!(manager.get_worker(7).is_none());
     }
@@ -1767,8 +1922,16 @@ mod tests {
         manager.add_test_worker(worker);
         manager.worker_sessions.clear();
 
-        assert!(!manager.accept_block_report_session(7, "other-session", 0));
-        assert!(manager.accept_block_report_session(7, "registered-session", 0));
+        assert!(
+            !manager
+                .accept_block_report_session(7, "other-session", 0)
+                .accepted
+        );
+        assert!(
+            manager
+                .accept_block_report_session(7, "registered-session", 0)
+                .accepted
+        );
     }
 
     #[test]

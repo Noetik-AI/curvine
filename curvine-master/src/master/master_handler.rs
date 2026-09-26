@@ -815,17 +815,20 @@ impl MasterHandler {
         }
         let lifecycle_lock = fs.worker_lifecycle_lock(worker_id);
         let _lifecycle_guard = lifecycle_lock.lock();
-        let report_is_current = fs.worker_manager.write().accept_block_report_session(
+        let session_result = fs.worker_manager.write().accept_block_report_session(
             worker_id,
             &worker_session_id,
             worker_startup_time_ms,
         );
-        if !report_is_current {
+        if !session_result.accepted {
             log::warn!(
                 "Ignore stale block report from worker {}: worker session does not match the active session",
                 worker_id
             );
             return Ok(Vec::new());
+        }
+        if session_result.reset_full_report {
+            fs.reset_full_block_report(worker_id);
         }
 
         let list = ProtoUtils::block_report_list_from_pb(header);
@@ -1365,6 +1368,70 @@ mod tests {
                 .reset_full_report
         );
         assert_eq!(fs.pending_full_block_report_len(address.worker_id), Some(1));
+    }
+
+    #[test]
+    fn newer_report_replaces_failover_guess_and_resets_partial_report() {
+        Master::init_test_metrics();
+        let test_name = Utils::rand_str(6);
+        let mut conf = ClusterConf::format();
+        conf.testing = true;
+        conf.journal.enable = false;
+        conf.master.worker_end_cleanup_enabled = true;
+        conf.master.meta_dir = Utils::test_sub_dir(format!("master-handler-test/meta-{test_name}"));
+        conf.journal.journal_dir =
+            Utils::test_sub_dir(format!("master-handler-test/journal-{test_name}"));
+        let fs = JournalSystem::fs_only_for_test(&conf).unwrap();
+        let address = WorkerAddress {
+            worker_id: 7,
+            ..Default::default()
+        };
+
+        MasterHandler::process_worker_heartbeat(
+            fs.clone(),
+            WorkerHeartbeatRequest {
+                status: HeartbeatStatus::Running.into(),
+                cluster_id: conf.cluster_id.clone(),
+                address: ProtoUtils::worker_address_to_pb(&address),
+                worker_session_id: Some("stale-session".to_string()),
+                fs_ctime: 100,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let report = |session: &str, startup_time_ms, block_id| BlockReportListRequest {
+            cluster_id: conf.cluster_id.clone(),
+            worker_id: address.worker_id,
+            full_report: true,
+            total_len: 2,
+            blocks: vec![BlockReportInfoProto {
+                id: block_id,
+                status: BlockReportStatus::Finalized.into(),
+                storage_type: StorageType::Disk.into(),
+                block_size: 1,
+            }],
+            worker_session_id: Some(session.to_string()),
+            worker_startup_time_ms: Some(startup_time_ms),
+        };
+
+        MasterHandler::process_block_report(fs.clone(), None, report("stale-session", 100, 1))
+            .unwrap();
+        assert_eq!(fs.pending_full_block_report_len(address.worker_id), Some(1));
+
+        MasterHandler::process_block_report(
+            fs.clone(),
+            None,
+            report("replacement-session", 200, 2),
+        )
+        .unwrap();
+        assert_eq!(fs.pending_full_block_report_len(address.worker_id), Some(1));
+        assert!(
+            fs.worker_manager
+                .write()
+                .accept_block_report_session(address.worker_id, "replacement-session", 200)
+                .accepted
+        );
     }
 
     #[test]
