@@ -1292,6 +1292,14 @@ impl MasterFilesystem {
         self.invalidate_full_block_reconcile(worker_id);
     }
 
+    #[cfg(test)]
+    pub(crate) fn pending_full_block_report_len(&self, worker_id: u32) -> Option<usize> {
+        self.full_block_reports
+            .lock()
+            .get(&worker_id)
+            .map(|report| report.reported_blocks.len())
+    }
+
     fn invalidate_full_block_report_session(&self, worker_id: u32) {
         let now = LocalTime::mills();
         let mut reports = self.full_block_reports.lock();

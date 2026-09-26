@@ -77,6 +77,9 @@ pub struct WorkerHeartbeatResult {
     /// Present only when an End heartbeat matches the active worker process
     /// session, including the Start-to-Running registration gap.
     pub cleanup_token: Option<WorkerCleanupToken>,
+    /// True when an accepted lifecycle transition supersedes any in-progress
+    /// full report from an older process session.
+    pub reset_full_report: bool,
 }
 
 impl WorkerManager {
@@ -138,6 +141,14 @@ impl WorkerManager {
                         session.startup_time_ms = startup_time_ms;
                     }
                 }
+                true
+            }
+            Some((false, false, tracked_startup_time_ms, _))
+                if startup_time_ms > tracked_startup_time_ms =>
+            {
+                // A fresh leader may first reconstruct an older process from a
+                // delayed Running heartbeat. Let a provably newer process replace it.
+                self.start_worker_session(worker_id, session_id.to_string(), startup_time_ms);
                 true
             }
             Some((false, false, _, _)) => false,
@@ -442,7 +453,7 @@ impl WorkerManager {
             );
         }
 
-        let cmds = match status {
+        let (cmds, reset_full_report) = match status {
             HeartbeatStatus::Start => {
                 info!("Worker register: {}", addr);
                 if let Some(session) = self.worker_sessions.get(&addr.worker_id) {
@@ -491,10 +502,17 @@ impl WorkerManager {
                 // Same node restarting: clear the slot so we do not treat it as ready or run
                 // Running heartbeat bookkeeping until insert() on the next Running beat.
                 self.worker_map.remove(&addr);
-                return Ok(Default::default());
+                return Ok(WorkerHeartbeatResult {
+                    reset_full_report: true,
+                    ..Default::default()
+                });
             }
 
             HeartbeatStatus::Running => {
+                let tracked_session_id = self
+                    .worker_sessions
+                    .get(&addr.worker_id)
+                    .map(|session| session.session_id.clone());
                 if !self.accept_running_session(addr.worker_id, &worker_session_id, startup_time_ms)
                 {
                     warn!(
@@ -503,7 +521,13 @@ impl WorkerManager {
                     );
                     return Ok(Default::default());
                 }
-                self.block_map.handle_heartbeat(addr.worker_id)
+                let reset_full_report = tracked_session_id
+                    .map(|session_id| session_id != worker_session_id)
+                    .unwrap_or(false);
+                (
+                    self.block_map.handle_heartbeat(addr.worker_id),
+                    reset_full_report,
+                )
             }
 
             HeartbeatStatus::End => {
@@ -562,6 +586,7 @@ impl WorkerManager {
         Ok(WorkerHeartbeatResult {
             commands: cmds,
             cleanup_token: None,
+            reset_full_report,
         })
     }
 
@@ -1476,6 +1501,50 @@ mod tests {
             manager.get_worker(7).unwrap().worker_session_id,
             "current-session"
         );
+    }
+
+    #[test]
+    fn newer_running_session_replaces_failover_guess() {
+        let mut manager = robin_manager();
+        let cluster_id = manager.cluster_id.clone();
+        let addr = WorkerAddress {
+            worker_id: 7,
+            ..Default::default()
+        };
+
+        manager
+            .heartbeat(
+                &cluster_id,
+                HeartbeatStatus::Running,
+                addr.clone(),
+                1,
+                "stale-session".to_string(),
+                TransferWorkerCapabilities::default(),
+                String::new(),
+                100,
+                vec![],
+                None,
+            )
+            .unwrap();
+        let result = manager
+            .heartbeat(
+                &cluster_id,
+                HeartbeatStatus::Running,
+                addr,
+                1,
+                "replacement-session".to_string(),
+                TransferWorkerCapabilities::default(),
+                String::new(),
+                200,
+                vec![],
+                None,
+            )
+            .unwrap();
+        assert!(result.reset_full_report);
+
+        let worker = manager.get_worker(7).unwrap();
+        assert_eq!(worker.worker_session_id, "replacement-session");
+        assert_eq!(worker.startup_time_ms, 200);
     }
 
     #[test]
