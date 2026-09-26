@@ -627,14 +627,16 @@ impl MasterHandler {
             )?;
         }
         let result = Self::process_worker_heartbeat(self.fs.clone(), header)?;
-        if self.fs.conf.worker_end_cleanup_enabled {
-            if let Some(cleanup_token) = result.cleanup_token {
+        if let Some(cleanup_token) = result.cleanup_token {
+            if self.fs.conf.worker_end_cleanup_enabled {
                 schedule_worker_cleanup(
                     self.control_rpc_executor.clone(),
                     self.fs.clone(),
                     self.replication_manager.clone(),
                     cleanup_token,
                 );
+            } else {
+                self.fs.worker_manager.write().finish_cleanup(cleanup_token);
             }
         }
         let rep_header = WorkerHeartbeatResponse {
@@ -1249,10 +1251,20 @@ mod tests {
             min_protocol_version: Some(1),
             capabilities: vec!["transfer".to_string()],
         };
+        let start_header = WorkerHeartbeatRequest {
+            status: HeartbeatStatus::Start.into(),
+            cluster_id: conf.cluster_id.clone(),
+            address: ProtoUtils::worker_address_to_pb(&address),
+            worker_session_id: Some("test-session".to_string()),
+            ..Default::default()
+        };
+        MasterHandler::process_worker_heartbeat(fs.clone(), start_header).unwrap();
+
         let header = WorkerHeartbeatRequest {
             status: HeartbeatStatus::Running.into(),
             cluster_id: conf.cluster_id.clone(),
             address: ProtoUtils::worker_address_to_pb(&address),
+            worker_session_id: Some("test-session".to_string()),
             software_version: "0.1.0-test".to_string(),
             fs_ctime: 123_456,
             component_info: Some(component_info.clone()),

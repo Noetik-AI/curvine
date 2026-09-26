@@ -28,10 +28,15 @@ pub(crate) fn schedule_worker_cleanup(
     cleanup_token: WorkerCleanupToken,
 ) {
     let worker_id = cleanup_token.worker_id();
+    let cleanup_fs = fs.clone();
     let res = executor.spawn(move || {
-        let lifecycle_lock = fs.worker_lifecycle_lock(worker_id);
+        let lifecycle_lock = cleanup_fs.worker_lifecycle_lock(worker_id);
         let _lifecycle_guard = lifecycle_lock.lock();
-        if !fs.worker_manager.read().is_cleanup_current(cleanup_token) {
+        if !cleanup_fs
+            .worker_manager
+            .read()
+            .is_cleanup_current(cleanup_token)
+        {
             info!(
                 "Skip stale block-location cleanup for worker {} because a newer session is active",
                 worker_id
@@ -40,7 +45,7 @@ pub(crate) fn schedule_worker_cleanup(
         }
 
         let spend = TimeSpent::new();
-        let cleanup = match fs.delete_locations(worker_id) {
+        let cleanup = match cleanup_fs.delete_locations(worker_id) {
             Err(e) => {
                 warn!("{}", curvine_core_error::err_msg!(e));
                 Default::default()
@@ -61,11 +66,18 @@ pub(crate) fn schedule_worker_cleanup(
             worker_id,
             spend.used_ms()
         );
+        cleanup_fs
+            .worker_manager
+            .write()
+            .finish_cleanup(cleanup_token);
     });
     if let Err(e) = res {
         warn!(
             "Failed to schedule block-location cleanup for worker {}: {}",
             worker_id, e
         );
+        let lifecycle_lock = fs.worker_lifecycle_lock(worker_id);
+        let _lifecycle_guard = lifecycle_lock.lock();
+        fs.worker_manager.write().finish_cleanup(cleanup_token);
     }
 }

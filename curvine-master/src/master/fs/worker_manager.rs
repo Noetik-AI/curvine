@@ -105,9 +105,19 @@ impl WorkerManager {
             Some(session) => !session.ended && session.session_id == session_id,
             None => {
                 // Compatibility for masters that did not observe Start (for example after
-                // failover): the first Running heartbeat establishes the active session.
-                self.start_worker_session(worker_id, session_id.to_string());
-                true
+                // failover): a Running heartbeat may restore the session only when the
+                // worker was already registered. A removed worker must send Start before
+                // it can establish a new process generation.
+                let registered_matches = self
+                    .worker_map
+                    .workers
+                    .get(&worker_id)
+                    .map(|worker| worker.worker_session_id == session_id)
+                    .unwrap_or(false);
+                if registered_matches {
+                    self.start_worker_session(worker_id, session_id.to_string());
+                }
+                registered_matches
             }
         }
     }
@@ -171,15 +181,44 @@ impl WorkerManager {
             .unwrap_or(false)
     }
 
+    /// Retire an ended session after its one cleanup attempt. The generation
+    /// check prevents a delayed cleanup from removing a replacement session.
+    pub fn finish_cleanup(&mut self, token: WorkerCleanupToken) {
+        if self.is_cleanup_current(token) {
+            self.worker_sessions.remove(&token.worker_id);
+        }
+    }
+
     pub fn is_block_report_current(&self, worker_id: u32, session_id: &str) -> bool {
-        self.worker_sessions
-            .get(&worker_id)
-            .map(|session| {
-                // Empty is the rolling-upgrade policy for legacy workers that do not yet
-                // include worker_session_id in BlockReportListRequest.
-                !session.ended && (session_id.is_empty() || session.session_id == session_id)
-            })
-            .unwrap_or(false)
+        match self.worker_sessions.get(&worker_id) {
+            Some(session) => {
+                !session.ended
+                    && if session_id.is_empty() {
+                        // A legacy report cannot be fenced across an End/replacement
+                        // boundary. Enabling End cleanup therefore requires upgraded
+                        // workers that attach their process session to block reports.
+                        !self.conf.master.worker_end_cleanup_enabled
+                    } else {
+                        session.session_id == session_id
+                    }
+            }
+            None => {
+                // Compatibility for lifecycle state restored without the in-memory
+                // tracker. This cannot revive a worker removed by End because cleanup
+                // removes it from the registered worker map first.
+                self.worker_map
+                    .workers
+                    .get(&worker_id)
+                    .map(|worker| {
+                        if session_id.is_empty() {
+                            !self.conf.master.worker_end_cleanup_enabled
+                        } else {
+                            worker.worker_session_id == session_id
+                        }
+                    })
+                    .unwrap_or(false)
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -737,13 +776,14 @@ mod tests {
     #[test]
     fn replacement_start_fences_queued_cleanup() {
         let mut manager = robin_manager();
+        manager.conf.master.worker_end_cleanup_enabled = true;
         let mut worker = worker_with_available(7, 100);
         worker.worker_session_id = "ended-session".to_string();
         let addr = worker.address.clone();
         manager.add_test_worker(worker);
         let cluster_id = manager.cluster_id.clone();
         assert!(manager.is_block_report_current(7, "ended-session"));
-        assert!(manager.is_block_report_current(7, ""));
+        assert!(!manager.is_block_report_current(7, ""));
 
         let cleanup_token = manager
             .heartbeat(
@@ -781,7 +821,67 @@ mod tests {
 
         assert!(!manager.is_cleanup_current(cleanup_token));
         assert!(!manager.is_block_report_current(7, "ended-session"));
+        assert!(!manager.is_block_report_current(7, ""));
         assert!(manager.is_block_report_current(7, "replacement-session"));
+
+        manager.finish_cleanup(cleanup_token);
+        assert!(manager.is_block_report_current(7, "replacement-session"));
+    }
+
+    #[test]
+    fn legacy_block_reports_remain_compatible_when_end_cleanup_is_disabled() {
+        let mut manager = robin_manager();
+        let mut worker = worker_with_available(7, 100);
+        worker.worker_session_id = "current-session".to_string();
+        manager.add_test_worker(worker);
+
+        assert!(manager.is_block_report_current(7, ""));
+    }
+
+    #[test]
+    fn finished_cleanup_rejects_late_running_and_legacy_reports() {
+        let mut manager = robin_manager();
+        let mut worker = worker_with_available(7, 100);
+        worker.worker_session_id = "ended-session".to_string();
+        let addr = worker.address.clone();
+        manager.add_test_worker(worker);
+        let cluster_id = manager.cluster_id.clone();
+
+        let cleanup_token = manager
+            .heartbeat(
+                &cluster_id,
+                HeartbeatStatus::End,
+                addr.clone(),
+                1,
+                "ended-session".to_string(),
+                TransferWorkerCapabilities::default(),
+                String::new(),
+                0,
+                vec![],
+                None,
+            )
+            .unwrap()
+            .cleanup_token
+            .unwrap();
+        manager.finish_cleanup(cleanup_token);
+
+        assert!(!manager.is_cleanup_current(cleanup_token));
+        assert!(!manager.is_block_report_current(7, ""));
+        manager
+            .heartbeat(
+                &cluster_id,
+                HeartbeatStatus::Running,
+                addr,
+                1,
+                "ended-session".to_string(),
+                TransferWorkerCapabilities::default(),
+                String::new(),
+                0,
+                vec![],
+                None,
+            )
+            .unwrap();
+        assert!(manager.get_worker(7).is_none());
     }
 
     #[test]
