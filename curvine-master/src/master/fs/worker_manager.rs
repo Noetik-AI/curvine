@@ -141,6 +141,23 @@ impl WorkerManager {
         }
     }
 
+    fn can_replace_reconstructed_running_session(
+        &self,
+        worker_id: u32,
+        session_id: &str,
+        startup_time_ms: u64,
+    ) -> bool {
+        self.worker_sessions
+            .get(&worker_id)
+            .map(|session| {
+                !session.ended
+                    && session.reconstructed_from_running
+                    && session.session_id != session_id
+                    && startup_time_ms > session.startup_time_ms
+            })
+            .unwrap_or(false)
+    }
+
     fn accept_running_session(
         &mut self,
         worker_id: u32,
@@ -596,8 +613,26 @@ impl WorkerManager {
             }
 
             HeartbeatStatus::Running => {
-                // Validate before accept_running_session can replace lifecycle state.
-                self.worker_map.ensure_worker_id_addr(&addr)?;
+                // A registration reconstructed only from failover Running traffic is a
+                // guess. A provably newer process may fence that guess even when its
+                // ephemeral address changed; verified sessions retain strict validation.
+                let replace_reconstructed = self.can_replace_reconstructed_running_session(
+                    addr.worker_id,
+                    &worker_session_id,
+                    startup_time_ms,
+                );
+                if replace_reconstructed {
+                    if let Some(previous_addr) = self
+                        .worker_map
+                        .workers
+                        .get(&addr.worker_id)
+                        .map(|worker| worker.address.clone())
+                    {
+                        self.worker_map.remove(&previous_addr);
+                    }
+                } else {
+                    self.worker_map.ensure_worker_id_addr(&addr)?;
+                }
                 let tracked_session_id = self
                     .worker_sessions
                     .get(&addr.worker_id)
@@ -1877,11 +1912,18 @@ mod tests {
                 None,
             )
             .unwrap();
+        let replacement_addr = WorkerAddress {
+            hostname: "replacement-worker".to_string(),
+            ip_addr: "10.0.0.2".to_string(),
+            rpc_port: 9100,
+            web_port: 9101,
+            ..addr
+        };
         let result = manager
             .heartbeat(
                 &cluster_id,
                 HeartbeatStatus::Running,
-                addr,
+                replacement_addr.clone(),
                 1,
                 "replacement-session".to_string(),
                 TransferWorkerCapabilities::default(),
@@ -1896,6 +1938,10 @@ mod tests {
         let worker = manager.get_worker(7).unwrap();
         assert_eq!(worker.worker_session_id, "replacement-session");
         assert_eq!(worker.startup_time_ms, 200);
+        assert_eq!(worker.address.hostname, replacement_addr.hostname);
+        assert_eq!(worker.address.ip_addr, replacement_addr.ip_addr);
+        assert_eq!(worker.address.rpc_port, replacement_addr.rpc_port);
+        assert_eq!(worker.address.web_port, replacement_addr.web_port);
     }
 
     #[test]
@@ -1910,6 +1956,20 @@ mod tests {
             web_port: 9001,
         };
 
+        manager
+            .heartbeat(
+                &cluster_id,
+                HeartbeatStatus::Start,
+                current_addr.clone(),
+                1,
+                "current-session".to_string(),
+                TransferWorkerCapabilities::default(),
+                String::new(),
+                100,
+                vec![],
+                None,
+            )
+            .unwrap();
         manager
             .heartbeat(
                 &cluster_id,
