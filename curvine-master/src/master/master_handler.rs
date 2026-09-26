@@ -1371,6 +1371,68 @@ mod tests {
     }
 
     #[test]
+    fn legacy_restart_resets_in_progress_full_report() {
+        Master::init_test_metrics();
+        let test_name = Utils::rand_str(6);
+        let mut conf = ClusterConf::format();
+        conf.testing = true;
+        conf.journal.enable = false;
+        conf.master.meta_dir = Utils::test_sub_dir(format!("master-handler-test/meta-{test_name}"));
+        conf.journal.journal_dir =
+            Utils::test_sub_dir(format!("master-handler-test/journal-{test_name}"));
+        let fs = JournalSystem::fs_only_for_test(&conf).unwrap();
+        let address = WorkerAddress {
+            worker_id: 7,
+            ..Default::default()
+        };
+        let start = |startup_time_ms| WorkerHeartbeatRequest {
+            status: HeartbeatStatus::Start.into(),
+            cluster_id: conf.cluster_id.clone(),
+            address: ProtoUtils::worker_address_to_pb(&address),
+            worker_session_id: Some(String::new()),
+            fs_ctime: startup_time_ms,
+            ..Default::default()
+        };
+
+        assert!(
+            MasterHandler::process_worker_heartbeat(fs.clone(), start(100))
+                .unwrap()
+                .reset_full_report
+        );
+        fs.block_report(
+            BlockReportList {
+                cluster_id: conf.cluster_id.clone(),
+                worker_id: address.worker_id,
+                full_report: true,
+                total_len: 2,
+                blocks: vec![BlockReportInfo::new(
+                    1,
+                    BlockReportStatus::Finalized,
+                    StorageType::Disk,
+                    1,
+                )],
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(fs.pending_full_block_report_len(address.worker_id), Some(1));
+
+        assert!(
+            !MasterHandler::process_worker_heartbeat(fs.clone(), start(100))
+                .unwrap()
+                .reset_full_report
+        );
+        assert_eq!(fs.pending_full_block_report_len(address.worker_id), Some(1));
+
+        assert!(
+            MasterHandler::process_worker_heartbeat(fs.clone(), start(200))
+                .unwrap()
+                .reset_full_report
+        );
+        assert_eq!(fs.pending_full_block_report_len(address.worker_id), None);
+    }
+
+    #[test]
     fn newer_report_replaces_failover_guess_and_resets_partial_report() {
         Master::init_test_metrics();
         let test_name = Utils::rand_str(6);

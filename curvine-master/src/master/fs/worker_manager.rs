@@ -572,7 +572,10 @@ impl WorkerManager {
             HeartbeatStatus::Start => {
                 info!("Worker register: {}", addr);
                 if let Some(session) = self.worker_sessions.get(&addr.worker_id) {
-                    if session.session_id == worker_session_id {
+                    let same_process = session.session_id == worker_session_id
+                        && (!worker_session_id.is_empty()
+                            || session.startup_time_ms == startup_time_ms);
+                    if same_process {
                         if session.ended {
                             warn!(
                                 "Ignore stale Start heartbeat from ended worker session {}",
@@ -591,7 +594,10 @@ impl WorkerManager {
                     }
                 }
                 if let Some(worker) = self.worker_map.workers.get(&addr.worker_id) {
-                    if worker.worker_session_id == worker_session_id {
+                    let same_process = worker.worker_session_id == worker_session_id
+                        && (!worker_session_id.is_empty()
+                            || worker.startup_time_ms == startup_time_ms);
+                    if same_process {
                         // A retried Start from the active process is already satisfied.
                         return Ok(Default::default());
                     }
