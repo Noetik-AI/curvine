@@ -59,7 +59,7 @@ struct WorkerSessionState {
     session_id: String,
     startup_time_ms: u64,
     generation: u64,
-    reconstructed_from_running: bool,
+    reconstructed_after_failover: bool,
     ended: bool,
     cleanup_pending: bool,
     retain_after_cleanup: bool,
@@ -120,7 +120,7 @@ impl WorkerManager {
                 session_id,
                 startup_time_ms,
                 generation,
-                reconstructed_from_running: false,
+                reconstructed_after_failover: false,
                 ended: false,
                 cleanup_pending: false,
                 retain_after_cleanup: false,
@@ -129,7 +129,7 @@ impl WorkerManager {
         );
     }
 
-    fn reconstruct_worker_session(
+    fn reconstruct_failover_session(
         &mut self,
         worker_id: u32,
         session_id: String,
@@ -137,11 +137,11 @@ impl WorkerManager {
     ) {
         self.start_worker_session(worker_id, session_id, startup_time_ms);
         if let Some(session) = self.worker_sessions.get_mut(&worker_id) {
-            session.reconstructed_from_running = true;
+            session.reconstructed_after_failover = true;
         }
     }
 
-    fn can_replace_reconstructed_running_session(
+    fn can_replace_failover_reconstructed_session(
         &self,
         worker_id: u32,
         session_id: &str,
@@ -151,7 +151,7 @@ impl WorkerManager {
             .get(&worker_id)
             .map(|session| {
                 !session.ended
-                    && session.reconstructed_from_running
+                    && session.reconstructed_after_failover
                     && session.session_id != session_id
                     && startup_time_ms > session.startup_time_ms
             })
@@ -181,7 +181,7 @@ impl WorkerManager {
                 session.session_id == session_id,
                 session.startup_time_ms,
                 session.unverified_end_since_ms.is_some(),
-                session.reconstructed_from_running,
+                session.reconstructed_after_failover,
             )
         }) {
             Some((false, true, tracked_startup_time_ms, _, _)) => {
@@ -195,9 +195,13 @@ impl WorkerManager {
             Some((false, false, tracked_startup_time_ms, _, true))
                 if startup_time_ms > tracked_startup_time_ms =>
             {
-                // A fresh leader may first reconstruct an older process from a
-                // delayed Running heartbeat. Let a provably newer process replace it.
-                self.reconstruct_worker_session(worker_id, session_id.to_string(), startup_time_ms);
+                // A fresh leader may first reconstruct an older process from delayed
+                // Running or report traffic. Let a provably newer process replace it.
+                self.reconstruct_failover_session(
+                    worker_id,
+                    session_id.to_string(),
+                    startup_time_ms,
+                );
                 true
             }
             Some((false, false, _, _, _)) => false,
@@ -215,7 +219,11 @@ impl WorkerManager {
                 // An End first seen after failover is held for one lost-worker
                 // interval. A newer process can prove the End was stale before
                 // destructive cleanup begins.
-                self.reconstruct_worker_session(worker_id, session_id.to_string(), startup_time_ms);
+                self.reconstruct_failover_session(
+                    worker_id,
+                    session_id.to_string(),
+                    startup_time_ms,
+                );
                 true
             }
             Some(_) => false,
@@ -237,7 +245,7 @@ impl WorkerManager {
                             None => (session_id.to_string(), startup_time_ms),
                         },
                     };
-                self.reconstruct_worker_session(
+                self.reconstruct_failover_session(
                     worker_id,
                     tracked_session_id,
                     tracked_startup_time_ms,
@@ -334,7 +342,7 @@ impl WorkerManager {
                 session_id: session_id.to_string(),
                 startup_time_ms: tracked_startup_time_ms,
                 generation,
-                reconstructed_from_running: false,
+                reconstructed_after_failover: false,
                 ended: true,
                 cleanup_pending: !untracked_failover_end,
                 retain_after_cleanup: untracked_failover_end,
@@ -453,14 +461,14 @@ impl WorkerManager {
             matches,
             tracked_startup_time_ms,
             unverified_end,
-            reconstructed_from_running,
+            reconstructed_after_failover,
         )) = self.worker_sessions.get(&worker_id).map(|session| {
             (
                 session.ended,
                 session_id.is_empty() || session.session_id == session_id,
                 session.startup_time_ms,
                 session.unverified_end_since_ms.is_some(),
-                session.reconstructed_from_running,
+                session.reconstructed_after_failover,
             )
         }) {
             let tracked_session_id = self
@@ -469,7 +477,7 @@ impl WorkerManager {
                 .map(|session| session.session_id.clone())
                 .unwrap_or_default();
             let recoverable_reconstructed_timeout = ended
-                && reconstructed_from_running
+                && reconstructed_after_failover
                 && self.is_recoverable_timeout_session(worker_id, &tracked_session_id);
             if !ended && matches {
                 return BlockReportSessionResult {
@@ -478,7 +486,7 @@ impl WorkerManager {
                 };
             }
             if !matches
-                && ((!ended && reconstructed_from_running)
+                && ((!ended && reconstructed_after_failover)
                     || unverified_end
                     || recoverable_reconstructed_timeout)
                 && startup_time_ms > tracked_startup_time_ms
@@ -513,7 +521,7 @@ impl WorkerManager {
         // A new leader may receive the startup full report before the first
         // Running heartbeat. Establish that session from the report, recover a
         // matching heartbeat-timeout worker, but never revive an explicit End.
-        let (tracked_session_id, tracked_startup_time_ms) = match self
+        let (tracked_session_id, tracked_startup_time_ms, reconstructed_after_failover) = match self
             .worker_map
             .workers
             .get(&worker_id)
@@ -521,19 +529,35 @@ impl WorkerManager {
             Some(worker) if !session_id.is_empty() && worker.worker_session_id != session_id => {
                 return Default::default();
             }
-            Some(worker) => (worker.worker_session_id.clone(), worker.startup_time_ms),
+            Some(worker) => (
+                worker.worker_session_id.clone(),
+                worker.startup_time_ms,
+                false,
+            ),
             None => match self.worker_map.lost_workers.get(&worker_id) {
                 Some(worker)
                     if worker.status == WorkerStatus::Lost
                         && (session_id.is_empty() || worker.worker_session_id == session_id) =>
                 {
-                    (worker.worker_session_id.clone(), worker.startup_time_ms)
+                    (
+                        worker.worker_session_id.clone(),
+                        worker.startup_time_ms,
+                        false,
+                    )
                 }
                 Some(_) => return Default::default(),
-                None => (session_id.to_string(), startup_time_ms),
+                None => (session_id.to_string(), startup_time_ms, true),
             },
         };
-        self.start_worker_session(worker_id, tracked_session_id, tracked_startup_time_ms);
+        if reconstructed_after_failover {
+            self.reconstruct_failover_session(
+                worker_id,
+                tracked_session_id,
+                tracked_startup_time_ms,
+            );
+        } else {
+            self.start_worker_session(worker_id, tracked_session_id, tracked_startup_time_ms);
+        }
         BlockReportSessionResult {
             accepted: true,
             reset_full_report: false,
@@ -624,10 +648,10 @@ impl WorkerManager {
             }
 
             HeartbeatStatus::Running => {
-                // A registration reconstructed only from failover Running traffic is a
-                // guess. A provably newer process may fence that guess even when its
-                // ephemeral address changed; verified sessions retain strict validation.
-                let replace_reconstructed = self.can_replace_reconstructed_running_session(
+                // A registration reconstructed only from failover Running/report traffic
+                // is a guess. A provably newer process may fence it even when its ephemeral
+                // address changed; verified sessions retain strict validation.
+                let replace_reconstructed = self.can_replace_failover_reconstructed_session(
                     addr.worker_id,
                     &worker_session_id,
                     startup_time_ms,
@@ -837,7 +861,7 @@ impl WorkerManager {
                         session_id: worker.worker_session_id.clone(),
                         startup_time_ms: worker.startup_time_ms,
                         generation,
-                        reconstructed_from_running: false,
+                        reconstructed_after_failover: false,
                         ended: true,
                         cleanup_pending: true,
                         retain_after_cleanup: false,
@@ -1764,6 +1788,43 @@ mod tests {
             manager.get_worker(7).unwrap().worker_session_id,
             "replacement-session"
         );
+    }
+
+    #[test]
+    fn newer_running_replaces_report_only_failover_guess() {
+        let mut manager = robin_manager();
+        manager.conf.master.worker_end_cleanup_enabled = true;
+        let cluster_id = manager.cluster_id.clone();
+        let addr = WorkerAddress {
+            worker_id: 7,
+            ..Default::default()
+        };
+
+        assert!(
+            manager
+                .accept_block_report_session(7, "stale-session", 100)
+                .accepted
+        );
+
+        let result = manager
+            .heartbeat(
+                &cluster_id,
+                HeartbeatStatus::Running,
+                addr,
+                1,
+                "replacement-session".to_string(),
+                TransferWorkerCapabilities::default(),
+                String::new(),
+                200,
+                vec![],
+                None,
+            )
+            .unwrap();
+
+        assert!(result.reset_full_report);
+        let worker = manager.get_worker(7).unwrap();
+        assert_eq!(worker.worker_session_id, "replacement-session");
+        assert_eq!(worker.startup_time_ms, 200);
     }
 
     #[test]
