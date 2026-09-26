@@ -509,6 +509,8 @@ impl WorkerManager {
             }
 
             HeartbeatStatus::Running => {
+                // Validate before accept_running_session can replace lifecycle state.
+                self.worker_map.ensure_worker_id_addr(&addr)?;
                 let tracked_session_id = self
                     .worker_sessions
                     .get(&addr.worker_id)
@@ -1545,6 +1547,59 @@ mod tests {
         let worker = manager.get_worker(7).unwrap();
         assert_eq!(worker.worker_session_id, "replacement-session");
         assert_eq!(worker.startup_time_ms, 200);
+    }
+
+    #[test]
+    fn conflicting_running_address_does_not_replace_lifecycle_session() {
+        let mut manager = robin_manager();
+        let cluster_id = manager.cluster_id.clone();
+        let current_addr = WorkerAddress {
+            worker_id: 7,
+            hostname: "current-worker".to_string(),
+            ip_addr: "10.0.0.1".to_string(),
+            rpc_port: 9000,
+            web_port: 9001,
+        };
+
+        manager
+            .heartbeat(
+                &cluster_id,
+                HeartbeatStatus::Running,
+                current_addr.clone(),
+                1,
+                "current-session".to_string(),
+                TransferWorkerCapabilities::default(),
+                String::new(),
+                100,
+                vec![],
+                None,
+            )
+            .unwrap();
+
+        let conflicting_addr = WorkerAddress {
+            hostname: "conflicting-worker".to_string(),
+            ip_addr: "10.0.0.2".to_string(),
+            ..current_addr.clone()
+        };
+        let result = manager.heartbeat(
+            &cluster_id,
+            HeartbeatStatus::Running,
+            conflicting_addr,
+            1,
+            "replacement-session".to_string(),
+            TransferWorkerCapabilities::default(),
+            String::new(),
+            200,
+            vec![],
+            None,
+        );
+
+        assert!(result.is_err());
+        assert!(manager.accept_block_report_session(7, "current-session"));
+        assert!(!manager.accept_block_report_session(7, "replacement-session"));
+        let worker = manager.get_worker(7).unwrap();
+        assert_eq!(worker.address.hostname, current_addr.hostname);
+        assert_eq!(worker.worker_session_id, "current-session");
     }
 
     #[test]

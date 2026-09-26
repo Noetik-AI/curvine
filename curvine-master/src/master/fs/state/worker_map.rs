@@ -72,10 +72,15 @@ impl WorkerMap {
 
     pub fn ensure_worker_id_addr(&self, addr: &WorkerAddress) -> FsResult<()> {
         if let Some(v) = self.workers.get(&addr.worker_id) {
-            if v.address != *addr {
+            let registered = &v.address;
+            if registered.hostname != addr.hostname
+                || registered.ip_addr != addr.ip_addr
+                || registered.rpc_port != addr.rpc_port
+                || registered.web_port != addr.web_port
+            {
                 return err_box!(
                     "worker id addr mismatch,  expected {}, actual: {}",
-                    v.address,
+                    registered,
                     addr
                 );
             }
