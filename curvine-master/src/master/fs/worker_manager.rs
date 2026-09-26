@@ -28,8 +28,8 @@ use log::{info, warn};
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 
-// Bound the generation window that rejects late messages from processes which
-// ended before they ever reached the registered worker map.
+// Bound the generation window that rejects late messages from processes whose
+// explicit End cleanup has completed.
 const MAX_COMPLETED_WORKER_SESSION_TOMBSTONES: usize = 1024;
 
 pub struct WorkerManager {
@@ -383,8 +383,9 @@ impl WorkerManager {
         }
     }
 
-    /// Retire an ended session after its one cleanup attempt. The generation
-    /// check prevents a delayed cleanup from removing a replacement session.
+    /// Complete an ended session's one cleanup attempt. The generation check
+    /// protects replacements; retained terminal sessions are pruned to the
+    /// bounded tombstone limit.
     pub fn finish_cleanup(&mut self, token: WorkerCleanupToken) {
         if !self.is_cleanup_current(token) {
             return;
@@ -637,8 +638,10 @@ impl WorkerManager {
                     // Validate the process session before mutating registration state. During
                     // Start-to-Running there is intentionally no registered worker, but the
                     // lifecycle tracker still makes the matching End eligible for cleanup.
-                    if self.worker_map.workers.contains_key(&addr.worker_id) {
+                    let retain_tombstone = if self.worker_map.workers.contains_key(&addr.worker_id)
+                    {
                         let _ = self.worker_map.remove_offline(addr.worker_id);
+                        self.conf.master.worker_end_cleanup_enabled
                     } else if let Some(worker) =
                         self.worker_map.lost_workers.get_mut(&addr.worker_id)
                     {
@@ -646,10 +649,14 @@ impl WorkerManager {
                         // the existing lost-worker record but prevent Running from
                         // treating it as a recoverable timeout.
                         worker.status = WorkerStatus::Unknown;
+                        self.conf.master.worker_end_cleanup_enabled
                     } else {
                         // Preserve a bounded lifecycle tombstone when End arrives in
                         // the Start-to-Running gap. It fences late messages without
                         // growing lost_workers for processes that never registered.
+                        true
+                    };
+                    if retain_tombstone {
                         self.retain_cleanup_tombstone(token);
                     }
                 }
@@ -1369,7 +1376,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_start_gap_tombstones_are_bounded() {
+    fn completed_end_tombstones_are_bounded() {
         let mut manager = robin_manager();
 
         for worker_id in 0..=(MAX_COMPLETED_WORKER_SESSION_TOMBSTONES as u32) {
@@ -1508,8 +1515,9 @@ mod tests {
     }
 
     #[test]
-    fn finished_cleanup_rejects_late_running_and_legacy_reports() {
+    fn finished_cleanup_fences_old_session_and_allows_newer_start() {
         let mut manager = robin_manager();
+        manager.conf.master.worker_end_cleanup_enabled = true;
         let mut worker = worker_with_available(7, 100);
         worker.worker_session_id = "ended-session".to_string();
         let addr = worker.address.clone();
@@ -1535,6 +1543,21 @@ mod tests {
         manager.finish_cleanup(cleanup_token);
 
         assert!(!manager.is_cleanup_current(cleanup_token));
+        let start_result = manager
+            .heartbeat(
+                &cluster_id,
+                HeartbeatStatus::Start,
+                addr.clone(),
+                1,
+                "ended-session".to_string(),
+                TransferWorkerCapabilities::default(),
+                String::new(),
+                0,
+                vec![],
+                None,
+            )
+            .unwrap();
+        assert!(!start_result.reset_full_report);
         assert!(!manager.accept_block_report_session(7, "", 0).accepted);
         assert!(
             !manager
@@ -1545,7 +1568,7 @@ mod tests {
             .heartbeat(
                 &cluster_id,
                 HeartbeatStatus::Running,
-                addr,
+                addr.clone(),
                 1,
                 "ended-session".to_string(),
                 TransferWorkerCapabilities::default(),
@@ -1556,6 +1579,45 @@ mod tests {
             )
             .unwrap();
         assert!(manager.get_worker(7).is_none());
+
+        let start_result = manager
+            .heartbeat(
+                &cluster_id,
+                HeartbeatStatus::Start,
+                addr.clone(),
+                1,
+                "replacement-session".to_string(),
+                TransferWorkerCapabilities::default(),
+                String::new(),
+                1,
+                vec![],
+                None,
+            )
+            .unwrap();
+        assert!(start_result.reset_full_report);
+        assert!(
+            manager
+                .accept_block_report_session(7, "replacement-session", 1)
+                .accepted
+        );
+        manager
+            .heartbeat(
+                &cluster_id,
+                HeartbeatStatus::Running,
+                addr,
+                1,
+                "replacement-session".to_string(),
+                TransferWorkerCapabilities::default(),
+                String::new(),
+                1,
+                vec![],
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            manager.get_worker(7).unwrap().worker_session_id,
+            "replacement-session"
+        );
     }
 
     #[test]
