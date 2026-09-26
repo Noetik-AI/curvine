@@ -158,6 +158,17 @@ impl WorkerManager {
             .unwrap_or(false)
     }
 
+    fn remove_reused_endpoint_workers(&mut self, addr: &WorkerAddress) {
+        for stale in self.worker_map.remove_same_endpoint(addr) {
+            self.worker_sessions.remove(&stale.worker_id());
+            warn!(
+                "Remove stale worker {} on reused endpoint {}",
+                stale.simple_debug(),
+                addr
+            );
+        }
+    }
+
     fn accept_running_session(
         &mut self,
         worker_id: u32,
@@ -595,13 +606,7 @@ impl WorkerManager {
                 // Enforce the same worker_id ↔ address rule as insert() before remove(): a Start
                 // from a conflicting address must not evict the live registration.
                 self.worker_map.ensure_worker_id_addr(&addr)?;
-                for stale in self.worker_map.remove_same_endpoint(&addr) {
-                    warn!(
-                        "Remove stale worker {} on restart endpoint {}",
-                        stale.simple_debug(),
-                        addr
-                    );
-                }
+                self.remove_reused_endpoint_workers(&addr);
                 self.start_worker_session(addr.worker_id, worker_session_id, startup_time_ms);
                 // Same node restarting: clear the slot so we do not treat it as ready or run
                 // Running heartbeat bookkeeping until insert() on the next Running beat.
@@ -702,6 +707,7 @@ impl WorkerManager {
             }
         };
 
+        self.remove_reused_endpoint_workers(&addr);
         self.worker_map.insert(
             addr,
             weight,
@@ -2017,6 +2023,58 @@ mod tests {
         let worker = manager.get_worker(7).unwrap();
         assert_eq!(worker.address.hostname, current_addr.hostname);
         assert_eq!(worker.worker_session_id, "current-session");
+    }
+
+    #[test]
+    fn reused_endpoint_retires_stale_worker_session() {
+        let mut manager = robin_manager();
+        let cluster_id = manager.cluster_id.clone();
+        let old_addr = WorkerAddress {
+            worker_id: 7,
+            hostname: "worker-host".to_string(),
+            ip_addr: "10.0.0.7".to_string(),
+            rpc_port: 9000,
+            web_port: 9001,
+        };
+
+        manager
+            .heartbeat(
+                &cluster_id,
+                HeartbeatStatus::Running,
+                old_addr.clone(),
+                1,
+                "old-session".to_string(),
+                TransferWorkerCapabilities::default(),
+                String::new(),
+                100,
+                vec![],
+                None,
+            )
+            .unwrap();
+        assert!(manager.worker_sessions.contains_key(&old_addr.worker_id));
+
+        let replacement_addr = WorkerAddress {
+            worker_id: 8,
+            ..old_addr
+        };
+        manager
+            .heartbeat(
+                &cluster_id,
+                HeartbeatStatus::Start,
+                replacement_addr,
+                1,
+                "replacement-session".to_string(),
+                TransferWorkerCapabilities::default(),
+                String::new(),
+                200,
+                vec![],
+                None,
+            )
+            .unwrap();
+
+        assert!(manager.get_worker(7).is_none());
+        assert!(!manager.worker_sessions.contains_key(&7));
+        assert!(manager.worker_sessions.contains_key(&8));
     }
 
     #[test]
