@@ -380,7 +380,12 @@ impl WorkerManager {
         }
     }
 
-    pub fn accept_block_report_session(&mut self, worker_id: u32, session_id: &str) -> bool {
+    pub fn accept_block_report_session(
+        &mut self,
+        worker_id: u32,
+        session_id: &str,
+        startup_time_ms: u64,
+    ) -> bool {
         if session_id.is_empty() && self.conf.master.worker_end_cleanup_enabled {
             // A legacy report cannot be fenced across an End/replacement boundary.
             // Enabling End cleanup therefore requires upgraded workers that attach
@@ -405,23 +410,27 @@ impl WorkerManager {
         // A new leader may receive the startup full report before the first
         // Running heartbeat. Establish that session from the report, recover a
         // matching heartbeat-timeout worker, but never revive an explicit End.
-        let tracked_session_id = match self.worker_map.workers.get(&worker_id) {
+        let (tracked_session_id, tracked_startup_time_ms) = match self
+            .worker_map
+            .workers
+            .get(&worker_id)
+        {
             Some(worker) if !session_id.is_empty() && worker.worker_session_id != session_id => {
                 return false;
             }
-            Some(worker) => worker.worker_session_id.clone(),
+            Some(worker) => (worker.worker_session_id.clone(), worker.startup_time_ms),
             None => match self.worker_map.lost_workers.get(&worker_id) {
                 Some(worker)
                     if worker.status == WorkerStatus::Lost
                         && (session_id.is_empty() || worker.worker_session_id == session_id) =>
                 {
-                    worker.worker_session_id.clone()
+                    (worker.worker_session_id.clone(), worker.startup_time_ms)
                 }
                 Some(_) => return false,
-                None => session_id.to_string(),
+                None => (session_id.to_string(), startup_time_ms),
             },
         };
-        self.start_worker_session(worker_id, tracked_session_id, 0);
+        self.start_worker_session(worker_id, tracked_session_id, tracked_startup_time_ms);
         true
     }
 
@@ -1256,7 +1265,7 @@ mod tests {
             )
             .unwrap();
 
-        assert!(manager.accept_block_report_session(7, "replacement-session"));
+        assert!(manager.accept_block_report_session(7, "replacement-session", 0));
         manager
             .heartbeat(
                 &cluster_id,
@@ -1314,8 +1323,8 @@ mod tests {
         let addr = worker.address.clone();
         manager.add_test_worker(worker);
         let cluster_id = manager.cluster_id.clone();
-        assert!(manager.accept_block_report_session(7, "ended-session"));
-        assert!(!manager.accept_block_report_session(7, ""));
+        assert!(manager.accept_block_report_session(7, "ended-session", 0));
+        assert!(!manager.accept_block_report_session(7, "", 0));
 
         let cleanup_token = manager
             .heartbeat(
@@ -1334,7 +1343,7 @@ mod tests {
             .cleanup_token
             .unwrap();
         assert!(manager.is_cleanup_current(cleanup_token));
-        assert!(!manager.accept_block_report_session(7, "ended-session"));
+        assert!(!manager.accept_block_report_session(7, "ended-session", 0));
 
         manager
             .heartbeat(
@@ -1352,12 +1361,12 @@ mod tests {
             .unwrap();
 
         assert!(!manager.is_cleanup_current(cleanup_token));
-        assert!(!manager.accept_block_report_session(7, "ended-session"));
-        assert!(!manager.accept_block_report_session(7, ""));
-        assert!(manager.accept_block_report_session(7, "replacement-session"));
+        assert!(!manager.accept_block_report_session(7, "ended-session", 0));
+        assert!(!manager.accept_block_report_session(7, "", 0));
+        assert!(manager.accept_block_report_session(7, "replacement-session", 0));
 
         manager.finish_cleanup(cleanup_token);
-        assert!(manager.accept_block_report_session(7, "replacement-session"));
+        assert!(manager.accept_block_report_session(7, "replacement-session", 0));
     }
 
     #[test]
@@ -1367,7 +1376,7 @@ mod tests {
         worker.worker_session_id = "current-session".to_string();
         manager.add_test_worker(worker);
 
-        assert!(manager.accept_block_report_session(7, ""));
+        assert!(manager.accept_block_report_session(7, "", 0));
     }
 
     #[test]
@@ -1424,8 +1433,8 @@ mod tests {
         manager.finish_cleanup(cleanup_token);
 
         assert!(!manager.is_cleanup_current(cleanup_token));
-        assert!(!manager.accept_block_report_session(7, ""));
-        assert!(!manager.accept_block_report_session(7, "ended-session"));
+        assert!(!manager.accept_block_report_session(7, "", 0));
+        assert!(!manager.accept_block_report_session(7, "ended-session", 0));
         manager
             .heartbeat(
                 &cluster_id,
@@ -1453,8 +1462,8 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(manager.accept_block_report_session(7, "startup-session"));
-        assert!(!manager.accept_block_report_session(7, "other-session"));
+        assert!(manager.accept_block_report_session(7, "startup-session", 123));
+        assert!(!manager.accept_block_report_session(7, "other-session", 0));
 
         manager
             .heartbeat(
@@ -1465,7 +1474,7 @@ mod tests {
                 "startup-session".to_string(),
                 TransferWorkerCapabilities::default(),
                 String::new(),
-                0,
+                123,
                 vec![],
                 None,
             )
@@ -1473,6 +1482,56 @@ mod tests {
         assert_eq!(
             manager.get_worker(7).unwrap().worker_session_id,
             "startup-session"
+        );
+    }
+
+    #[test]
+    fn startup_report_orders_session_before_delayed_running_after_failover() {
+        let mut manager = robin_manager();
+        manager.conf.master.worker_end_cleanup_enabled = true;
+        let cluster_id = manager.cluster_id.clone();
+        let addr = WorkerAddress {
+            worker_id: 7,
+            ..Default::default()
+        };
+
+        assert!(manager.accept_block_report_session(7, "replacement-session", 200));
+
+        let stale_result = manager
+            .heartbeat(
+                &cluster_id,
+                HeartbeatStatus::Running,
+                addr.clone(),
+                1,
+                "stale-session".to_string(),
+                TransferWorkerCapabilities::default(),
+                String::new(),
+                100,
+                vec![],
+                None,
+            )
+            .unwrap();
+        assert!(!stale_result.reset_full_report);
+        assert!(manager.get_worker(7).is_none());
+        assert!(manager.accept_block_report_session(7, "replacement-session", 200));
+
+        manager
+            .heartbeat(
+                &cluster_id,
+                HeartbeatStatus::Running,
+                addr,
+                1,
+                "replacement-session".to_string(),
+                TransferWorkerCapabilities::default(),
+                String::new(),
+                200,
+                vec![],
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            manager.get_worker(7).unwrap().worker_session_id,
+            "replacement-session"
         );
     }
 
@@ -1595,8 +1654,8 @@ mod tests {
         );
 
         assert!(result.is_err());
-        assert!(manager.accept_block_report_session(7, "current-session"));
-        assert!(!manager.accept_block_report_session(7, "replacement-session"));
+        assert!(manager.accept_block_report_session(7, "current-session", 0));
+        assert!(!manager.accept_block_report_session(7, "replacement-session", 0));
         let worker = manager.get_worker(7).unwrap();
         assert_eq!(worker.address.hostname, current_addr.hostname);
         assert_eq!(worker.worker_session_id, "current-session");
@@ -1695,7 +1754,7 @@ mod tests {
         manager.add_test_worker(worker);
 
         let (_, cleanup_token) = manager.remove_expired_worker(7).unwrap();
-        assert!(manager.accept_block_report_session(7, "timed-out-session"));
+        assert!(manager.accept_block_report_session(7, "timed-out-session", 0));
         assert!(manager.is_cleanup_current(cleanup_token));
         assert!(manager.get_worker(7).is_none());
     }
@@ -1708,8 +1767,8 @@ mod tests {
         manager.add_test_worker(worker);
         manager.worker_sessions.clear();
 
-        assert!(!manager.accept_block_report_session(7, "other-session"));
-        assert!(manager.accept_block_report_session(7, "registered-session"));
+        assert!(!manager.accept_block_report_session(7, "other-session", 0));
+        assert!(manager.accept_block_report_session(7, "registered-session", 0));
     }
 
     #[test]

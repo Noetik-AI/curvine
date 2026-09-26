@@ -153,6 +153,7 @@ fn test_block_report_legacy_request_decodes_without_session() {
     let decoded = BlockReportListRequest::decode(legacy.encode_to_vec().as_slice()).unwrap();
     assert_eq!(decoded.worker_id, 7);
     assert_eq!(decoded.worker_session_id, None);
+    assert_eq!(decoded.worker_startup_time_ms, None);
 }
 
 #[test]
@@ -163,10 +164,14 @@ fn test_block_report_session_is_ignored_by_legacy_master() {
         full_report: true,
         total_len: 0,
         worker_session_id: Some("worker-session".to_string()),
+        worker_startup_time_ms: Some(123_456),
         blocks: Vec::new(),
     };
 
-    let decoded = LegacyBlockReportListRequest::decode(current.encode_to_vec().as_slice()).unwrap();
+    let encoded = current.encode_to_vec();
+    let current_decoded = BlockReportListRequest::decode(encoded.as_slice()).unwrap();
+    assert_eq!(current_decoded.worker_startup_time_ms, Some(123_456));
+    let decoded = LegacyBlockReportListRequest::decode(encoded.as_slice()).unwrap();
     assert_eq!(decoded.worker_id, 7);
 }
 

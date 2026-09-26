@@ -134,6 +134,7 @@ message BlockReportListRequest {
     // Fences reports from an ended process against a replacement that reuses
     // the worker id. Legacy workers omit this field and remain accepted.
     optional string worker_session_id = 6 [default = ""];
+    optional uint64 worker_startup_time_ms = 7 [default = 0];
 }
 
 message BlockReportListResponse {

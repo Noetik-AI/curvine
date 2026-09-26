@@ -526,6 +526,7 @@ fn full_block_report_default_limit_to_master() -> CommonResult<()> {
         full_report: true,
         total_len: count as u64,
         worker_session_id: None,
+        worker_startup_time_ms: None,
         blocks: blocks
             .iter()
             .map(|block| BlockReportInfoProto {
@@ -738,6 +739,7 @@ fn send_worker_heartbeat(
             worker_id: worker_address.worker_id,
             address: ProtoUtils::worker_address_to_pb(worker_address),
             worker_session_id: Some(worker_session_id.to_string()),
+            fs_ctime: 123_456,
             ..Default::default()
         })
         .build();
@@ -835,6 +837,7 @@ fn queued_worker_end_cleanup_preserves_replacement_report() -> CommonResult<()> 
                 storage_type: block.storage_type.into(),
             }],
             worker_session_id: Some("replacement-session".to_string()),
+            worker_startup_time_ms: Some(123_456),
         })
         .build();
     let mut ctx = RpcContext::new(&request);

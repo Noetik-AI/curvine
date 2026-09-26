@@ -802,17 +802,24 @@ impl MasterHandler {
     ) -> FsResult<Vec<WorkerCommand>> {
         let worker_id = header.worker_id;
         let worker_session_id = header.worker_session_id.clone().unwrap_or_default();
+        let worker_startup_time_ms = header.worker_startup_time_ms.unwrap_or_default();
         if fs.conf.worker_end_cleanup_enabled && worker_session_id.is_empty() {
             return err_box!(
                 "worker_session_id is required when master.worker_end_cleanup_enabled is true"
             );
         }
+        if fs.conf.worker_end_cleanup_enabled && worker_startup_time_ms == 0 {
+            return err_box!(
+                "worker_startup_time_ms is required when master.worker_end_cleanup_enabled is true"
+            );
+        }
         let lifecycle_lock = fs.worker_lifecycle_lock(worker_id);
         let _lifecycle_guard = lifecycle_lock.lock();
-        let report_is_current = fs
-            .worker_manager
-            .write()
-            .accept_block_report_session(worker_id, &worker_session_id);
+        let report_is_current = fs.worker_manager.write().accept_block_report_session(
+            worker_id,
+            &worker_session_id,
+            worker_startup_time_ms,
+        );
         if !report_is_current {
             log::warn!(
                 "Ignore stale block report from worker {}: worker session does not match the active session",
@@ -1374,7 +1381,7 @@ mod tests {
         let fs = JournalSystem::fs_only_for_test(&conf).unwrap();
 
         let result = MasterHandler::process_block_report(
-            fs,
+            fs.clone(),
             None,
             BlockReportListRequest {
                 worker_id: 7,
@@ -1387,6 +1394,23 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("worker_session_id is required"));
+
+        let result = MasterHandler::process_block_report(
+            fs,
+            None,
+            BlockReportListRequest {
+                worker_id: 7,
+                worker_session_id: Some("session".to_string()),
+                ..Default::default()
+            },
+        );
+        let error = match result {
+            Ok(_) => panic!("block report without startup time should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("worker_startup_time_ms is required"));
     }
 
     #[test]
