@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::master::fs::MasterFilesystem;
+use crate::master::fs::{MasterFilesystem, WorkerCleanupToken};
 use crate::master::replication::master_replication_manager::MasterReplicationManager;
 use curvine_runtime::common::TimeSpent;
 use curvine_runtime::runtime::GroupExecutor;
@@ -25,9 +25,20 @@ pub(crate) fn schedule_worker_cleanup(
     executor: Arc<GroupExecutor>,
     fs: MasterFilesystem,
     replication_manager: Arc<MasterReplicationManager>,
-    worker_id: u32,
+    cleanup_token: WorkerCleanupToken,
 ) {
+    let worker_id = cleanup_token.worker_id();
     let res = executor.spawn(move || {
+        let lifecycle_lock = fs.worker_lifecycle_lock(worker_id);
+        let _lifecycle_guard = lifecycle_lock.lock();
+        if !fs.worker_manager.read().is_cleanup_current(cleanup_token) {
+            info!(
+                "Skip stale block-location cleanup for worker {} because a newer session is active",
+                worker_id
+            );
+            return;
+        }
+
         let spend = TimeSpent::new();
         let cleanup = match fs.delete_locations(worker_id) {
             Err(e) => {

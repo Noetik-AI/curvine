@@ -33,7 +33,7 @@ use curvine_runtime::sync::ArcRwLock;
 use log::{error, info, warn};
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 pub struct CvMetadataSnapshotEntry {
     pub status: FileStatus,
@@ -74,6 +74,7 @@ pub struct MasterFilesystem {
     full_block_reports: Arc<Mutex<HashMap<u32, FullBlockReportState>>>,
     full_block_reconciles: Arc<Mutex<HashMap<u32, FullBlockReconcileState>>>,
     full_block_reconcile_executor: Arc<GroupExecutor>,
+    worker_lifecycle_locks: Arc<Mutex<HashMap<u32, Weak<Mutex<()>>>>>,
 }
 
 pub struct BlockReportResult {
@@ -177,6 +178,7 @@ impl MasterFilesystem {
                 FULL_BLOCK_RECONCILE_THREADS,
                 FULL_BLOCK_RECONCILE_QUEUE_SIZE,
             )),
+            worker_lifecycle_locks: Default::default(),
         }
     }
 
@@ -193,7 +195,23 @@ impl MasterFilesystem {
                 FULL_BLOCK_RECONCILE_THREADS,
                 FULL_BLOCK_RECONCILE_QUEUE_SIZE,
             )),
+            worker_lifecycle_locks: Default::default(),
         }
+    }
+
+    /// Serialize lifecycle transitions, block reports, and cleanup for one worker without
+    /// blocking unrelated workers. Weak entries are pruned opportunistically so ephemeral
+    /// worker ids do not make the lock registry grow forever.
+    pub(crate) fn worker_lifecycle_lock(&self, worker_id: u32) -> Arc<Mutex<()>> {
+        let mut locks = self.worker_lifecycle_locks.lock();
+        if let Some(lock) = locks.get(&worker_id).and_then(Weak::upgrade) {
+            return lock;
+        }
+
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        let lock = Arc::new(Mutex::new(()));
+        locks.insert(worker_id, Arc::downgrade(&lock));
+        lock
     }
 
     pub fn check_parent(path: &InodePath) -> FsResult<()> {

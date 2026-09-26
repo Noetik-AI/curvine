@@ -13,7 +13,7 @@
 // limitations under the License.
 
 mod worker_manager;
-pub use self::worker_manager::{WorkerHeartbeatResult, WorkerManager};
+pub use self::worker_manager::{WorkerCleanupToken, WorkerHeartbeatResult, WorkerManager};
 
 mod heartbeat_checker;
 pub use self::heartbeat_checker::HeartbeatChecker;

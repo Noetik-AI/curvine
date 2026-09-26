@@ -25,7 +25,7 @@ use curvine_model::{
 use curvine_proto::ComponentInfoProto;
 use curvine_runtime::common::{ByteUnit, LocalTime};
 use log::{info, warn};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 
 pub struct WorkerManager {
@@ -34,14 +34,35 @@ pub struct WorkerManager {
     pub(crate) worker_policy: WorkerPolicyAdapter,
     pub(crate) cluster_id: String,
     pub(crate) conf: ClusterConf,
+    worker_sessions: HashMap<u32, WorkerSessionState>,
+    next_worker_session_generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WorkerCleanupToken {
+    worker_id: u32,
+    generation: u64,
+}
+
+impl WorkerCleanupToken {
+    pub fn worker_id(&self) -> u32 {
+        self.worker_id
+    }
+}
+
+#[derive(Clone, Debug)]
+struct WorkerSessionState {
+    session_id: String,
+    generation: u64,
+    ended: bool,
 }
 
 #[derive(Default)]
 pub struct WorkerHeartbeatResult {
     pub commands: Vec<WorkerCommand>,
-    /// Present only when an End heartbeat removed the same worker process
-    /// session that is currently registered on the master.
-    pub ended_worker_id: Option<u32>,
+    /// Present only when an End heartbeat matches the active worker process
+    /// session, including the Start-to-Running registration gap.
+    pub cleanup_token: Option<WorkerCleanupToken>,
 }
 
 impl WorkerManager {
@@ -54,7 +75,111 @@ impl WorkerManager {
             worker_policy,
             cluster_id: conf.cluster_id.to_string(),
             conf: conf.clone(),
+            worker_sessions: HashMap::new(),
+            next_worker_session_generation: 0,
         })
+    }
+
+    fn next_worker_session_generation(&mut self) -> u64 {
+        self.next_worker_session_generation = self
+            .next_worker_session_generation
+            .checked_add(1)
+            .expect("worker session generation exhausted");
+        self.next_worker_session_generation
+    }
+
+    fn start_worker_session(&mut self, worker_id: u32, session_id: String) {
+        let generation = self.next_worker_session_generation();
+        self.worker_sessions.insert(
+            worker_id,
+            WorkerSessionState {
+                session_id,
+                generation,
+                ended: false,
+            },
+        );
+    }
+
+    fn accept_running_session(&mut self, worker_id: u32, session_id: &str) -> bool {
+        match self.worker_sessions.get(&worker_id) {
+            Some(session) => !session.ended && session.session_id == session_id,
+            None => {
+                // Compatibility for masters that did not observe Start (for example after
+                // failover): the first Running heartbeat establishes the active session.
+                self.start_worker_session(worker_id, session_id.to_string());
+                true
+            }
+        }
+    }
+
+    fn end_worker_session(
+        &mut self,
+        worker_id: u32,
+        session_id: &str,
+    ) -> Option<WorkerCleanupToken> {
+        if self
+            .worker_map
+            .workers
+            .get(&worker_id)
+            .map(|worker| worker.worker_session_id != session_id)
+            .unwrap_or(false)
+        {
+            return None;
+        }
+
+        if let Some(session) = self.worker_sessions.get_mut(&worker_id) {
+            if session.ended || session.session_id != session_id {
+                return None;
+            }
+            session.ended = true;
+            return Some(WorkerCleanupToken {
+                worker_id,
+                generation: session.generation,
+            });
+        }
+
+        // Compatibility for state restored without the in-memory lifecycle tracker.
+        let registered_matches = self
+            .worker_map
+            .workers
+            .get(&worker_id)
+            .map(|worker| worker.worker_session_id == session_id)
+            .unwrap_or(false);
+        if !registered_matches {
+            return None;
+        }
+
+        let generation = self.next_worker_session_generation();
+        self.worker_sessions.insert(
+            worker_id,
+            WorkerSessionState {
+                session_id: session_id.to_string(),
+                generation,
+                ended: true,
+            },
+        );
+        Some(WorkerCleanupToken {
+            worker_id,
+            generation,
+        })
+    }
+
+    pub fn is_cleanup_current(&self, token: WorkerCleanupToken) -> bool {
+        self.worker_sessions
+            .get(&token.worker_id)
+            .map(|session| session.ended && session.generation == token.generation)
+            .unwrap_or(false)
+    }
+
+    pub fn is_block_report_current(&self, worker_id: u32, session_id: &str) -> bool {
+        self.worker_sessions
+            .get(&worker_id)
+            .map(|session| {
+                // Empty is the rolling-upgrade policy for legacy workers that do not yet
+                // include worker_session_id in BlockReportListRequest.
+                !session.ended && (session_id.is_empty() || session.session_id == session_id)
+            })
+            .unwrap_or(false)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -93,32 +218,42 @@ impl WorkerManager {
                         addr
                     );
                 }
+                self.start_worker_session(addr.worker_id, worker_session_id);
                 // Same node restarting: clear the slot so we do not treat it as ready or run
                 // Running heartbeat bookkeeping until insert() on the next Running beat.
                 self.worker_map.remove(&addr);
                 return Ok(Default::default());
             }
 
-            HeartbeatStatus::Running => self.block_map.handle_heartbeat(addr.worker_id),
+            HeartbeatStatus::Running => {
+                if !self.accept_running_session(addr.worker_id, &worker_session_id) {
+                    warn!(
+                        "Ignore stale Running heartbeat from worker {}: worker session does not match the active session",
+                        addr.worker_id
+                    );
+                    return Ok(Default::default());
+                }
+                self.block_map.handle_heartbeat(addr.worker_id)
+            }
 
             HeartbeatStatus::End => {
                 info!("Worker unregister: {}", addr);
-                let ended_worker_id = self
-                    .worker_map
-                    .remove_offline(addr.worker_id)
-                    .and_then(|worker| {
-                        if worker.worker_session_id == worker_session_id {
-                            Some(addr.worker_id)
-                        } else {
-                            warn!(
-                                "Skip destructive cleanup for stale End heartbeat from worker {}: worker session does not match the registered session",
-                                addr.worker_id
-                            );
-                            None
-                        }
-                    });
+                let cleanup_token = self.end_worker_session(addr.worker_id, &worker_session_id);
+                if cleanup_token.is_some() {
+                    // Validate the process session before mutating registration state. During
+                    // Start-to-Running there is intentionally no registered worker, but the
+                    // lifecycle tracker still makes the matching End eligible for cleanup.
+                    if self.worker_map.workers.contains_key(&addr.worker_id) {
+                        let _ = self.worker_map.remove_offline(addr.worker_id);
+                    }
+                } else {
+                    warn!(
+                        "Skip End heartbeat from worker {}: worker session does not match the active session",
+                        addr.worker_id
+                    );
+                }
                 return Ok(WorkerHeartbeatResult {
-                    ended_worker_id,
+                    cleanup_token,
                     ..Default::default()
                 });
             }
@@ -137,7 +272,7 @@ impl WorkerManager {
         self.expire_scheduled_bytes();
         Ok(WorkerHeartbeatResult {
             commands: cmds,
-            ended_worker_id: None,
+            cleanup_token: None,
         })
     }
 
@@ -232,8 +367,26 @@ impl WorkerManager {
             .fold(0, i64::saturating_add)
     }
 
-    pub fn remove_expired_worker(&mut self, id: u32) -> Option<WorkerInfo> {
-        self.worker_map.remove_expired(id)
+    pub fn remove_expired_worker(&mut self, id: u32) -> Option<(WorkerInfo, WorkerCleanupToken)> {
+        let worker = self.worker_map.remove_expired(id)?;
+        let cleanup_token = self
+            .end_worker_session(id, &worker.worker_session_id)
+            .unwrap_or_else(|| {
+                let generation = self.next_worker_session_generation();
+                self.worker_sessions.insert(
+                    id,
+                    WorkerSessionState {
+                        session_id: worker.worker_session_id.clone(),
+                        generation,
+                        ended: true,
+                    },
+                );
+                WorkerCleanupToken {
+                    worker_id: id,
+                    generation,
+                }
+            });
+        Some((worker, cleanup_token))
     }
 
     pub fn add_blacklist_worker(&mut self, id: u32) -> Option<WorkerInfo> {
@@ -320,6 +473,7 @@ impl WorkerManager {
     }
 
     pub fn add_test_worker(&mut self, worker: WorkerInfo) {
+        self.start_worker_session(worker.worker_id(), worker.worker_session_id.clone());
         self.worker_map.workers.insert(worker.worker_id(), worker);
     }
 
@@ -476,7 +630,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(result.ended_worker_id, Some(7));
+        assert_eq!(result.cleanup_token.map(|token| token.worker_id()), Some(7));
         assert!(manager.get_worker(7).is_none());
     }
 
@@ -485,6 +639,7 @@ mod tests {
         let mut manager = robin_manager();
         let mut worker = worker_with_available(7, 100);
         worker.worker_session_id = "replacement-session".to_string();
+        worker.status = WorkerStatus::Decommission;
         let addr = worker.address.clone();
         manager.add_test_worker(worker);
 
@@ -504,7 +659,129 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(result.ended_worker_id, None);
+        assert_eq!(result.cleanup_token, None);
+        assert_eq!(
+            manager.get_worker(7).unwrap().worker_session_id,
+            "replacement-session"
+        );
+        assert_eq!(
+            manager.get_worker(7).unwrap().status,
+            WorkerStatus::Decommission
+        );
+    }
+
+    #[test]
+    fn end_heartbeat_during_start_gap_marks_session_for_cleanup() {
+        let mut manager = robin_manager();
+        let addr = WorkerAddress {
+            worker_id: 7,
+            ..Default::default()
+        };
+        let cluster_id = manager.cluster_id.clone();
+
+        manager
+            .heartbeat(
+                &cluster_id,
+                HeartbeatStatus::Start,
+                addr.clone(),
+                1,
+                "starting-session".to_string(),
+                TransferWorkerCapabilities::default(),
+                String::new(),
+                0,
+                vec![],
+                None,
+            )
+            .unwrap();
+        assert!(manager.get_worker(7).is_none());
+
+        let result = manager
+            .heartbeat(
+                &cluster_id,
+                HeartbeatStatus::End,
+                addr,
+                1,
+                "starting-session".to_string(),
+                TransferWorkerCapabilities::default(),
+                String::new(),
+                0,
+                vec![],
+                None,
+            )
+            .unwrap();
+
+        let cleanup_token = result.cleanup_token.unwrap();
+        assert_eq!(cleanup_token.worker_id(), 7);
+
+        manager
+            .heartbeat(
+                &cluster_id,
+                HeartbeatStatus::Running,
+                WorkerAddress {
+                    worker_id: 7,
+                    ..Default::default()
+                },
+                1,
+                "starting-session".to_string(),
+                TransferWorkerCapabilities::default(),
+                String::new(),
+                0,
+                vec![],
+                None,
+            )
+            .unwrap();
+        assert!(manager.get_worker(7).is_none());
+        assert!(manager.is_cleanup_current(cleanup_token));
+    }
+
+    #[test]
+    fn replacement_start_fences_queued_cleanup() {
+        let mut manager = robin_manager();
+        let mut worker = worker_with_available(7, 100);
+        worker.worker_session_id = "ended-session".to_string();
+        let addr = worker.address.clone();
+        manager.add_test_worker(worker);
+        let cluster_id = manager.cluster_id.clone();
+        assert!(manager.is_block_report_current(7, "ended-session"));
+        assert!(manager.is_block_report_current(7, ""));
+
+        let cleanup_token = manager
+            .heartbeat(
+                &cluster_id,
+                HeartbeatStatus::End,
+                addr.clone(),
+                1,
+                "ended-session".to_string(),
+                TransferWorkerCapabilities::default(),
+                String::new(),
+                0,
+                vec![],
+                None,
+            )
+            .unwrap()
+            .cleanup_token
+            .unwrap();
+        assert!(manager.is_cleanup_current(cleanup_token));
+        assert!(!manager.is_block_report_current(7, "ended-session"));
+
+        manager
+            .heartbeat(
+                &cluster_id,
+                HeartbeatStatus::Start,
+                addr,
+                1,
+                "replacement-session".to_string(),
+                TransferWorkerCapabilities::default(),
+                String::new(),
+                0,
+                vec![],
+                None,
+            )
+            .unwrap();
+
+        assert!(!manager.is_cleanup_current(cleanup_token));
+        assert!(!manager.is_block_report_current(7, "ended-session"));
+        assert!(manager.is_block_report_current(7, "replacement-session"));
     }
 
     #[test]

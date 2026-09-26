@@ -80,8 +80,8 @@ impl LoopTask for HeartbeatChecker {
 
                 if now > last_update + self.worker_lost_ms {
                     // Heartbeat timeout
-                    if let Some(worker) = wm.remove_expired_worker(id) {
-                        removed_workers.push((id, worker.address, worker.last_update));
+                    if let Some((worker, cleanup_token)) = wm.remove_expired_worker(id) {
+                        removed_workers.push((cleanup_token, worker.address, worker.last_update));
                     }
                 }
             }
@@ -94,7 +94,8 @@ impl LoopTask for HeartbeatChecker {
             );
         }
 
-        for (id, address, last_update) in removed_workers {
+        for (cleanup_token, address, last_update) in removed_workers {
+            let id = cleanup_token.worker_id();
             warn!(
                 "Worker {} ({}) last heartbeat {} has exceeded lost timeout {} ms and will be removed",
                 id, address, last_update, self.worker_lost_ms
@@ -103,7 +104,7 @@ impl LoopTask for HeartbeatChecker {
                 self.executor.clone(),
                 self.fs.clone(),
                 self.replication_manager.clone(),
-                id,
+                cleanup_token,
             );
         }
 

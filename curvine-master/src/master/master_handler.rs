@@ -628,12 +628,12 @@ impl MasterHandler {
         }
         let result = Self::process_worker_heartbeat(self.fs.clone(), header)?;
         if self.fs.conf.worker_end_cleanup_enabled {
-            if let Some(worker_id) = result.ended_worker_id {
+            if let Some(cleanup_token) = result.cleanup_token {
                 schedule_worker_cleanup(
                     self.control_rpc_executor.clone(),
                     self.fs.clone(),
                     self.replication_manager.clone(),
-                    worker_id,
+                    cleanup_token,
                 );
             }
         }
@@ -750,6 +750,8 @@ impl MasterHandler {
     ) -> FsResult<WorkerHeartbeatResult> {
         let status = HeartbeatStatus::from(header.status);
         let address = ProtoUtils::worker_address_from_pb(&header.address);
+        let lifecycle_lock = fs.worker_lifecycle_lock(address.worker_id);
+        let _lifecycle_guard = lifecycle_lock.lock();
         // Worker weight comes from trusted administrator configuration. Preserve the
         // configured u32 value so the master does not silently alter allocation ratios.
         let weight = header.weight.unwrap_or_else(WorkerInfo::default_weight);
@@ -794,6 +796,22 @@ impl MasterHandler {
         replication_handler: Option<MasterReplicationHandler>,
         header: BlockReportListRequest,
     ) -> FsResult<Vec<WorkerCommand>> {
+        let worker_id = header.worker_id;
+        let worker_session_id = header.worker_session_id.clone().unwrap_or_default();
+        let lifecycle_lock = fs.worker_lifecycle_lock(worker_id);
+        let _lifecycle_guard = lifecycle_lock.lock();
+        if !fs
+            .worker_manager
+            .read()
+            .is_block_report_current(worker_id, &worker_session_id)
+        {
+            log::warn!(
+                "Ignore stale block report from worker {}: worker session does not match the active session",
+                worker_id
+            );
+            return Ok(Vec::new());
+        }
+
         let list = ProtoUtils::block_report_list_from_pb(header);
         let result = fs.block_report(list, replication_handler)?;
 
