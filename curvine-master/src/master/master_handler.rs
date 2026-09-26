@@ -802,11 +802,11 @@ impl MasterHandler {
         let worker_session_id = header.worker_session_id.clone().unwrap_or_default();
         let lifecycle_lock = fs.worker_lifecycle_lock(worker_id);
         let _lifecycle_guard = lifecycle_lock.lock();
-        if !fs
+        let report_is_current = fs
             .worker_manager
-            .read()
-            .is_block_report_current(worker_id, &worker_session_id)
-        {
+            .write()
+            .accept_block_report_session(worker_id, &worker_session_id);
+        if !report_is_current {
             log::warn!(
                 "Ignore stale block report from worker {}: worker session does not match the active session",
                 worker_id

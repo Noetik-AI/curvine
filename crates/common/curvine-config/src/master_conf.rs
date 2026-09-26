@@ -80,10 +80,6 @@ pub struct MasterConf {
     #[serde(skip)]
     pub worker_lost_interval_unit: DurationUnit,
 
-    // Treat an explicit worker End heartbeat like a lost-worker timeout by
-    // removing its block locations and triggering cache/replica recovery.
-    pub worker_end_cleanup_enabled: bool,
-
     // Audit log configuration.
     pub audit_logging_enabled: bool,
     pub audit_log: LogConf,
@@ -146,6 +142,10 @@ pub struct MasterConf {
 
     #[serde(default = "MasterConf::rocksdb_default")]
     pub rocksdb: DBConf,
+
+    // Treat an explicit worker End heartbeat like a lost-worker timeout by
+    // removing its block locations and triggering cache/replica recovery.
+    pub worker_end_cleanup_enabled: bool,
 }
 
 impl MasterConf {
