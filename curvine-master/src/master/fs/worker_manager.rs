@@ -204,7 +204,11 @@ impl WorkerManager {
             .map(|worker| worker.worker_session_id == session_id)
             .unwrap_or(false);
         let timed_out_matches = self.is_recoverable_timeout_session(worker_id, session_id);
-        if !registered_matches && !timed_out_matches {
+        let untracked_failover_end = self.conf.master.worker_end_cleanup_enabled
+            && !session_id.is_empty()
+            && !self.worker_map.workers.contains_key(&worker_id)
+            && !self.worker_map.lost_workers.contains_key(&worker_id);
+        if !registered_matches && !timed_out_matches && !untracked_failover_end {
             return None;
         }
 
@@ -360,6 +364,31 @@ impl WorkerManager {
         let cmds = match status {
             HeartbeatStatus::Start => {
                 info!("Worker register: {}", addr);
+                if self
+                    .worker_sessions
+                    .get(&addr.worker_id)
+                    .map(|session| session.ended && session.session_id == worker_session_id)
+                    .unwrap_or(false)
+                {
+                    warn!(
+                        "Ignore stale Start heartbeat from ended worker session {}",
+                        addr.worker_id
+                    );
+                    return Ok(Default::default());
+                }
+                if let Some(worker) = self.worker_map.workers.get(&addr.worker_id) {
+                    if worker.worker_session_id == worker_session_id {
+                        // A retried Start from the active process is already satisfied.
+                        return Ok(Default::default());
+                    }
+                    if startup_time_ms <= worker.startup_time_ms {
+                        warn!(
+                            "Ignore stale Start heartbeat from worker {} with startup time {}; active session started at {}",
+                            addr.worker_id, startup_time_ms, worker.startup_time_ms
+                        );
+                        return Ok(Default::default());
+                    }
+                }
                 // Enforce the same worker_id ↔ address rule as insert() before remove(): a Start
                 // from a conflicting address must not evict the live registration.
                 self.worker_map.ensure_worker_id_addr(&addr)?;
@@ -919,6 +948,84 @@ mod tests {
             )
             .unwrap();
         assert!(manager.get_worker(7).is_none());
+    }
+
+    #[test]
+    fn end_heartbeat_on_fresh_leader_marks_session_for_cleanup() {
+        let mut manager = robin_manager();
+        manager.conf.master.worker_end_cleanup_enabled = true;
+        let addr = WorkerAddress {
+            worker_id: 7,
+            ..Default::default()
+        };
+        let cluster_id = manager.cluster_id.clone();
+
+        let cleanup_token = manager
+            .heartbeat(
+                &cluster_id,
+                HeartbeatStatus::End,
+                addr.clone(),
+                1,
+                "ending-session".to_string(),
+                TransferWorkerCapabilities::default(),
+                String::new(),
+                123,
+                vec![],
+                None,
+            )
+            .unwrap()
+            .cleanup_token
+            .unwrap();
+
+        assert!(manager.is_cleanup_current(cleanup_token));
+        assert!(manager.worker_map.lost_workers.get(&7).is_none());
+        manager.finish_cleanup(cleanup_token);
+
+        manager
+            .heartbeat(
+                &cluster_id,
+                HeartbeatStatus::Start,
+                addr,
+                1,
+                "ending-session".to_string(),
+                TransferWorkerCapabilities::default(),
+                String::new(),
+                123,
+                vec![],
+                None,
+            )
+            .unwrap();
+        assert!(manager.get_worker(7).is_none());
+    }
+
+    #[test]
+    fn stale_start_does_not_replace_live_session() {
+        let mut manager = robin_manager();
+        let mut worker = worker_with_available(7, 100);
+        worker.worker_session_id = "replacement-session".to_string();
+        worker.startup_time_ms = 200;
+        let addr = worker.address.clone();
+        manager.add_test_worker(worker);
+        let cluster_id = manager.cluster_id.clone();
+
+        manager
+            .heartbeat(
+                &cluster_id,
+                HeartbeatStatus::Start,
+                addr,
+                1,
+                "stale-session".to_string(),
+                TransferWorkerCapabilities::default(),
+                String::new(),
+                100,
+                vec![],
+                None,
+            )
+            .unwrap();
+
+        let worker = manager.get_worker(7).unwrap();
+        assert_eq!(worker.worker_session_id, "replacement-session");
+        assert_eq!(worker.startup_time_ms, 200);
     }
 
     #[test]
