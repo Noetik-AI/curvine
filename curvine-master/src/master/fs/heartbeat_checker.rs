@@ -65,6 +65,7 @@ impl LoopTask for HeartbeatChecker {
 
         let mut blacklisted_workers = Vec::new();
         let mut removed_workers = Vec::new();
+        let unverified_end_cleanups;
         {
             let mut wm = self.fs.worker_manager.write();
             let workers = wm.get_last_heartbeat();
@@ -85,6 +86,7 @@ impl LoopTask for HeartbeatChecker {
                     }
                 }
             }
+            unverified_end_cleanups = wm.expire_unverified_worker_ends(now, self.worker_lost_ms);
         }
 
         for (id, address, last_update) in blacklisted_workers {
@@ -99,6 +101,20 @@ impl LoopTask for HeartbeatChecker {
             warn!(
                 "Worker {} ({}) last heartbeat {} has exceeded lost timeout {} ms and will be removed",
                 id, address, last_update, self.worker_lost_ms
+            );
+            schedule_worker_cleanup(
+                self.executor.clone(),
+                self.fs.clone(),
+                self.replication_manager.clone(),
+                cleanup_token,
+            );
+        }
+
+        for cleanup_token in unverified_end_cleanups {
+            let id = cleanup_token.worker_id();
+            warn!(
+                "Worker {} End was received without leader lifecycle state and remained unchallenged for {} ms; worker will be removed",
+                id, self.worker_lost_ms
             );
             schedule_worker_cleanup(
                 self.executor.clone(),

@@ -57,10 +57,18 @@ impl WorkerCleanupToken {
 #[derive(Clone, Debug)]
 struct WorkerSessionState {
     session_id: String,
+    startup_time_ms: u64,
     generation: u64,
     ended: bool,
     cleanup_pending: bool,
     retain_after_cleanup: bool,
+    unverified_end_since_ms: Option<u64>,
+}
+
+enum EndWorkerSessionResult {
+    Cleanup(WorkerCleanupToken),
+    Deferred,
+    Rejected,
 }
 
 #[derive(Default)]
@@ -94,52 +102,82 @@ impl WorkerManager {
         self.next_worker_session_generation
     }
 
-    fn start_worker_session(&mut self, worker_id: u32, session_id: String) {
+    fn start_worker_session(&mut self, worker_id: u32, session_id: String, startup_time_ms: u64) {
         let generation = self.next_worker_session_generation();
         self.worker_sessions.insert(
             worker_id,
             WorkerSessionState {
                 session_id,
+                startup_time_ms,
                 generation,
                 ended: false,
                 cleanup_pending: false,
                 retain_after_cleanup: false,
+                unverified_end_since_ms: None,
             },
         );
     }
 
-    fn accept_running_session(&mut self, worker_id: u32, session_id: &str) -> bool {
-        match self
-            .worker_sessions
-            .get(&worker_id)
-            .map(|session| (session.ended, session.session_id == session_id))
-        {
-            Some((false, matches)) => matches,
-            Some((true, true)) if self.is_recoverable_timeout_session(worker_id, session_id) => {
+    fn accept_running_session(
+        &mut self,
+        worker_id: u32,
+        session_id: &str,
+        startup_time_ms: u64,
+    ) -> bool {
+        match self.worker_sessions.get(&worker_id).map(|session| {
+            (
+                session.ended,
+                session.session_id == session_id,
+                session.startup_time_ms,
+                session.unverified_end_since_ms.is_some(),
+            )
+        }) {
+            Some((false, true, tracked_startup_time_ms, _)) => {
+                if tracked_startup_time_ms == 0 && startup_time_ms != 0 {
+                    if let Some(session) = self.worker_sessions.get_mut(&worker_id) {
+                        session.startup_time_ms = startup_time_ms;
+                    }
+                }
+                true
+            }
+            Some((false, false, _, _)) => false,
+            Some((true, true, _, _))
+                if self.is_recoverable_timeout_session(worker_id, session_id) =>
+            {
                 // Preserve the pre-existing behavior where a worker can rejoin after a
                 // temporary heartbeat timeout. A new generation invalidates queued cleanup.
-                self.start_worker_session(worker_id, session_id.to_string());
+                self.start_worker_session(worker_id, session_id.to_string(), startup_time_ms);
+                true
+            }
+            Some((true, false, ended_startup_time_ms, true))
+                if startup_time_ms > ended_startup_time_ms =>
+            {
+                // An End first seen after failover is held for one lost-worker
+                // interval. A newer process can prove the End was stale before
+                // destructive cleanup begins.
+                self.start_worker_session(worker_id, session_id.to_string(), startup_time_ms);
                 true
             }
             Some(_) => false,
             None => {
                 // A fresh leader has no lifecycle or worker-map state. Let a current
                 // Running session establish itself unless the worker is explicitly ended.
-                let tracked_session_id = match self.worker_map.workers.get(&worker_id) {
-                    Some(worker) if worker.worker_session_id != session_id => return false,
-                    Some(worker) => worker.worker_session_id.clone(),
-                    None => match self.worker_map.lost_workers.get(&worker_id) {
-                        Some(worker)
-                            if worker.status == WorkerStatus::Lost
-                                && worker.worker_session_id == session_id =>
-                        {
-                            worker.worker_session_id.clone()
-                        }
-                        Some(_) => return false,
-                        None => session_id.to_string(),
-                    },
-                };
-                self.start_worker_session(worker_id, tracked_session_id);
+                let (tracked_session_id, tracked_startup_time_ms) =
+                    match self.worker_map.workers.get(&worker_id) {
+                        Some(worker) if worker.worker_session_id != session_id => return false,
+                        Some(worker) => (worker.worker_session_id.clone(), worker.startup_time_ms),
+                        None => match self.worker_map.lost_workers.get(&worker_id) {
+                            Some(worker)
+                                if worker.status == WorkerStatus::Lost
+                                    && worker.worker_session_id == session_id =>
+                            {
+                                (worker.worker_session_id.clone(), worker.startup_time_ms)
+                            }
+                            Some(_) => return false,
+                            None => (session_id.to_string(), startup_time_ms),
+                        },
+                    };
+                self.start_worker_session(worker_id, tracked_session_id, tracked_startup_time_ms);
                 true
             }
         }
@@ -159,7 +197,8 @@ impl WorkerManager {
         &mut self,
         worker_id: u32,
         session_id: &str,
-    ) -> Option<WorkerCleanupToken> {
+        startup_time_ms: u64,
+    ) -> EndWorkerSessionResult {
         if self
             .worker_map
             .workers
@@ -167,30 +206,35 @@ impl WorkerManager {
             .map(|worker| worker.worker_session_id != session_id)
             .unwrap_or(false)
         {
-            return None;
+            return EndWorkerSessionResult::Rejected;
         }
 
         if let Some(session) = self.worker_sessions.get(&worker_id) {
             if session.session_id != session_id {
-                return None;
+                return EndWorkerSessionResult::Rejected;
             }
             if session.ended {
                 // A timeout is recoverable until the same process explicitly
                 // announces End. Reuse the queued timeout cleanup generation so
                 // a late Running heartbeat can no longer fence it.
-                return self
-                    .is_recoverable_timeout_session(worker_id, session_id)
-                    .then_some(WorkerCleanupToken {
+                if self.is_recoverable_timeout_session(worker_id, session_id) {
+                    return EndWorkerSessionResult::Cleanup(WorkerCleanupToken {
                         worker_id,
                         generation: session.generation,
                     });
+                }
+                return if session.unverified_end_since_ms.is_some() {
+                    EndWorkerSessionResult::Deferred
+                } else {
+                    EndWorkerSessionResult::Rejected
+                };
             }
         }
 
         if let Some(session) = self.worker_sessions.get_mut(&worker_id) {
             session.ended = true;
             session.cleanup_pending = true;
-            return Some(WorkerCleanupToken {
+            return EndWorkerSessionResult::Cleanup(WorkerCleanupToken {
                 worker_id,
                 generation: session.generation,
             });
@@ -209,24 +253,38 @@ impl WorkerManager {
             && !self.worker_map.workers.contains_key(&worker_id)
             && !self.worker_map.lost_workers.contains_key(&worker_id);
         if !registered_matches && !timed_out_matches && !untracked_failover_end {
-            return None;
+            return EndWorkerSessionResult::Rejected;
         }
 
+        let tracked_startup_time_ms = self
+            .worker_map
+            .workers
+            .get(&worker_id)
+            .or_else(|| self.worker_map.lost_workers.get(&worker_id))
+            .map(|worker| worker.startup_time_ms)
+            .unwrap_or(startup_time_ms);
         let generation = self.next_worker_session_generation();
         self.worker_sessions.insert(
             worker_id,
             WorkerSessionState {
                 session_id: session_id.to_string(),
+                startup_time_ms: tracked_startup_time_ms,
                 generation,
                 ended: true,
-                cleanup_pending: true,
-                retain_after_cleanup: false,
+                cleanup_pending: !untracked_failover_end,
+                retain_after_cleanup: untracked_failover_end,
+                unverified_end_since_ms: untracked_failover_end.then(LocalTime::mills),
             },
         );
-        Some(WorkerCleanupToken {
+        let token = WorkerCleanupToken {
             worker_id,
             generation,
-        })
+        };
+        if untracked_failover_end {
+            EndWorkerSessionResult::Deferred
+        } else {
+            EndWorkerSessionResult::Cleanup(token)
+        }
     }
 
     pub fn is_cleanup_current(&self, token: WorkerCleanupToken) -> bool {
@@ -244,6 +302,28 @@ impl WorkerManager {
                 session.retain_after_cleanup = true;
             }
         }
+    }
+
+    pub(crate) fn expire_unverified_worker_ends(
+        &mut self,
+        now_ms: u64,
+        grace_ms: u64,
+    ) -> Vec<WorkerCleanupToken> {
+        let mut cleanup_tokens = Vec::new();
+        for (worker_id, session) in &mut self.worker_sessions {
+            let expired = session
+                .unverified_end_since_ms
+                .map(|since_ms| now_ms.saturating_sub(since_ms) >= grace_ms)
+                .unwrap_or(false);
+            if session.ended && !session.cleanup_pending && expired {
+                session.cleanup_pending = true;
+                cleanup_tokens.push(WorkerCleanupToken {
+                    worker_id: *worker_id,
+                    generation: session.generation,
+                });
+            }
+        }
+        cleanup_tokens
     }
 
     fn prune_completed_worker_session_tombstones(&mut self) {
@@ -281,6 +361,7 @@ impl WorkerManager {
         if retain_after_cleanup {
             if let Some(session) = self.worker_sessions.get_mut(&token.worker_id) {
                 session.cleanup_pending = false;
+                session.unverified_end_since_ms = None;
             }
             self.prune_completed_worker_session_tombstones();
         } else {
@@ -329,7 +410,7 @@ impl WorkerManager {
                 None => session_id.to_string(),
             },
         };
-        self.start_worker_session(worker_id, tracked_session_id);
+        self.start_worker_session(worker_id, tracked_session_id, 0);
         true
     }
 
@@ -364,17 +445,24 @@ impl WorkerManager {
         let cmds = match status {
             HeartbeatStatus::Start => {
                 info!("Worker register: {}", addr);
-                if self
-                    .worker_sessions
-                    .get(&addr.worker_id)
-                    .map(|session| session.ended && session.session_id == worker_session_id)
-                    .unwrap_or(false)
-                {
-                    warn!(
-                        "Ignore stale Start heartbeat from ended worker session {}",
-                        addr.worker_id
-                    );
-                    return Ok(Default::default());
+                if let Some(session) = self.worker_sessions.get(&addr.worker_id) {
+                    if session.session_id == worker_session_id {
+                        if session.ended {
+                            warn!(
+                                "Ignore stale Start heartbeat from ended worker session {}",
+                                addr.worker_id
+                            );
+                        }
+                        // A retried Start from the active process is already satisfied.
+                        return Ok(Default::default());
+                    }
+                    if session.startup_time_ms != 0 && startup_time_ms <= session.startup_time_ms {
+                        warn!(
+                            "Ignore stale Start heartbeat from worker {} with startup time {}; tracked session started at {}",
+                            addr.worker_id, startup_time_ms, session.startup_time_ms
+                        );
+                        return Ok(Default::default());
+                    }
                 }
                 if let Some(worker) = self.worker_map.workers.get(&addr.worker_id) {
                     if worker.worker_session_id == worker_session_id {
@@ -399,7 +487,7 @@ impl WorkerManager {
                         addr
                     );
                 }
-                self.start_worker_session(addr.worker_id, worker_session_id);
+                self.start_worker_session(addr.worker_id, worker_session_id, startup_time_ms);
                 // Same node restarting: clear the slot so we do not treat it as ready or run
                 // Running heartbeat bookkeeping until insert() on the next Running beat.
                 self.worker_map.remove(&addr);
@@ -407,7 +495,8 @@ impl WorkerManager {
             }
 
             HeartbeatStatus::Running => {
-                if !self.accept_running_session(addr.worker_id, &worker_session_id) {
+                if !self.accept_running_session(addr.worker_id, &worker_session_id, startup_time_ms)
+                {
                     warn!(
                         "Ignore stale Running heartbeat from worker {}: worker session does not match the active session",
                         addr.worker_id
@@ -419,7 +508,19 @@ impl WorkerManager {
 
             HeartbeatStatus::End => {
                 info!("Worker unregister: {}", addr);
-                let cleanup_token = self.end_worker_session(addr.worker_id, &worker_session_id);
+                let end_result =
+                    self.end_worker_session(addr.worker_id, &worker_session_id, startup_time_ms);
+                let cleanup_token = match end_result {
+                    EndWorkerSessionResult::Cleanup(token) => Some(token),
+                    EndWorkerSessionResult::Deferred => None,
+                    EndWorkerSessionResult::Rejected => {
+                        warn!(
+                            "Skip End heartbeat from worker {}: worker session does not match the active session",
+                            addr.worker_id
+                        );
+                        return Ok(Default::default());
+                    }
+                };
                 if let Some(token) = cleanup_token {
                     // Validate the process session before mutating registration state. During
                     // Start-to-Running there is intentionally no registered worker, but the
@@ -439,11 +540,6 @@ impl WorkerManager {
                         // growing lost_workers for processes that never registered.
                         self.retain_cleanup_tombstone(token);
                     }
-                } else {
-                    warn!(
-                        "Skip End heartbeat from worker {}: worker session does not match the active session",
-                        addr.worker_id
-                    );
                 }
                 return Ok(WorkerHeartbeatResult {
                     cleanup_token,
@@ -562,25 +658,30 @@ impl WorkerManager {
 
     pub fn remove_expired_worker(&mut self, id: u32) -> Option<(WorkerInfo, WorkerCleanupToken)> {
         let worker = self.worker_map.remove_expired(id)?;
-        let cleanup_token = self
-            .end_worker_session(id, &worker.worker_session_id)
-            .unwrap_or_else(|| {
+        let cleanup_token =
+            self.end_worker_session(id, &worker.worker_session_id, worker.startup_time_ms);
+        let cleanup_token = match cleanup_token {
+            EndWorkerSessionResult::Cleanup(token) => token,
+            EndWorkerSessionResult::Deferred | EndWorkerSessionResult::Rejected => {
                 let generation = self.next_worker_session_generation();
                 self.worker_sessions.insert(
                     id,
                     WorkerSessionState {
                         session_id: worker.worker_session_id.clone(),
+                        startup_time_ms: worker.startup_time_ms,
                         generation,
                         ended: true,
                         cleanup_pending: true,
                         retain_after_cleanup: false,
+                        unverified_end_since_ms: None,
                     },
                 );
                 WorkerCleanupToken {
                     worker_id: id,
                     generation,
                 }
-            });
+            }
+        };
         Some((worker, cleanup_token))
     }
 
@@ -668,7 +769,11 @@ impl WorkerManager {
     }
 
     pub fn add_test_worker(&mut self, worker: WorkerInfo) {
-        self.start_worker_session(worker.worker_id(), worker.worker_session_id.clone());
+        self.start_worker_session(
+            worker.worker_id(),
+            worker.worker_session_id.clone(),
+            worker.startup_time_ms,
+        );
         self.worker_map.workers.insert(worker.worker_id(), worker);
     }
 
@@ -951,7 +1056,7 @@ mod tests {
     }
 
     #[test]
-    fn end_heartbeat_on_fresh_leader_marks_session_for_cleanup() {
+    fn end_heartbeat_on_fresh_leader_waits_for_failover_grace() {
         let mut manager = robin_manager();
         manager.conf.master.worker_end_cleanup_enabled = true;
         let addr = WorkerAddress {
@@ -960,7 +1065,7 @@ mod tests {
         };
         let cluster_id = manager.cluster_id.clone();
 
-        let cleanup_token = manager
+        let result = manager
             .heartbeat(
                 &cluster_id,
                 HeartbeatStatus::End,
@@ -973,12 +1078,20 @@ mod tests {
                 vec![],
                 None,
             )
-            .unwrap()
-            .cleanup_token
             .unwrap();
 
-        assert!(manager.is_cleanup_current(cleanup_token));
+        assert_eq!(result.cleanup_token, None);
         assert!(manager.worker_map.lost_workers.get(&7).is_none());
+        let unverified_since_ms = manager
+            .worker_sessions
+            .get(&7)
+            .unwrap()
+            .unverified_end_since_ms
+            .unwrap();
+        let cleanup_tokens = manager.expire_unverified_worker_ends(unverified_since_ms + 100, 100);
+        assert_eq!(cleanup_tokens.len(), 1);
+        let cleanup_token = cleanup_tokens[0];
+        assert!(manager.is_cleanup_current(cleanup_token));
         manager.finish_cleanup(cleanup_token);
 
         manager
@@ -996,6 +1109,56 @@ mod tests {
             )
             .unwrap();
         assert!(manager.get_worker(7).is_none());
+    }
+
+    #[test]
+    fn newer_running_session_cancels_unverified_end_after_failover() {
+        let mut manager = robin_manager();
+        manager.conf.master.worker_end_cleanup_enabled = true;
+        let addr = WorkerAddress {
+            worker_id: 7,
+            ..Default::default()
+        };
+        let cluster_id = manager.cluster_id.clone();
+
+        let result = manager
+            .heartbeat(
+                &cluster_id,
+                HeartbeatStatus::End,
+                addr.clone(),
+                1,
+                "stale-session".to_string(),
+                TransferWorkerCapabilities::default(),
+                String::new(),
+                100,
+                vec![],
+                None,
+            )
+            .unwrap();
+        assert_eq!(result.cleanup_token, None);
+
+        manager
+            .heartbeat(
+                &cluster_id,
+                HeartbeatStatus::Running,
+                addr,
+                1,
+                "replacement-session".to_string(),
+                TransferWorkerCapabilities::default(),
+                String::new(),
+                200,
+                vec![],
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(
+            manager.get_worker(7).unwrap().worker_session_id,
+            "replacement-session"
+        );
+        assert!(manager
+            .expire_unverified_worker_ends(u64::MAX, 0)
+            .is_empty());
     }
 
     #[test]
@@ -1029,13 +1192,78 @@ mod tests {
     }
 
     #[test]
+    fn stale_start_does_not_replace_session_during_registration_gap() {
+        let mut manager = robin_manager();
+        let addr = WorkerAddress {
+            worker_id: 7,
+            ..Default::default()
+        };
+        let cluster_id = manager.cluster_id.clone();
+
+        manager
+            .heartbeat(
+                &cluster_id,
+                HeartbeatStatus::Start,
+                addr.clone(),
+                1,
+                "replacement-session".to_string(),
+                TransferWorkerCapabilities::default(),
+                String::new(),
+                200,
+                vec![],
+                None,
+            )
+            .unwrap();
+        manager
+            .heartbeat(
+                &cluster_id,
+                HeartbeatStatus::Start,
+                addr.clone(),
+                1,
+                "stale-session".to_string(),
+                TransferWorkerCapabilities::default(),
+                String::new(),
+                100,
+                vec![],
+                None,
+            )
+            .unwrap();
+
+        assert!(manager.accept_block_report_session(7, "replacement-session"));
+        manager
+            .heartbeat(
+                &cluster_id,
+                HeartbeatStatus::Running,
+                addr,
+                1,
+                "replacement-session".to_string(),
+                TransferWorkerCapabilities::default(),
+                String::new(),
+                200,
+                vec![],
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            manager.get_worker(7).unwrap().worker_session_id,
+            "replacement-session"
+        );
+    }
+
+    #[test]
     fn completed_start_gap_tombstones_are_bounded() {
         let mut manager = robin_manager();
 
         for worker_id in 0..=(MAX_COMPLETED_WORKER_SESSION_TOMBSTONES as u32) {
             let session_id = format!("session-{worker_id}");
-            manager.start_worker_session(worker_id, session_id.clone());
-            let cleanup_token = manager.end_worker_session(worker_id, &session_id).unwrap();
+            manager.start_worker_session(worker_id, session_id.clone(), worker_id as u64);
+            let cleanup_token =
+                match manager.end_worker_session(worker_id, &session_id, worker_id as u64) {
+                    EndWorkerSessionResult::Cleanup(token) => token,
+                    EndWorkerSessionResult::Deferred | EndWorkerSessionResult::Rejected => {
+                        panic!("tracked session End must be accepted")
+                    }
+                };
             manager.retain_cleanup_tombstone(cleanup_token);
             manager.finish_cleanup(cleanup_token);
         }
