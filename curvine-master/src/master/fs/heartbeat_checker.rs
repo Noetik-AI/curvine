@@ -12,15 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::master::fs::MasterFilesystem;
+use crate::master::fs::{schedule_worker_cleanup, MasterFilesystem};
 use crate::master::quota::QuotaManager;
 use crate::master::replication::master_replication_manager::MasterReplicationManager;
 use crate::master::MasterMonitor;
 use curvine_error::FsError;
 use curvine_error::FsResult;
-use curvine_runtime::common::{LocalTime, TimeSpent};
+use curvine_runtime::common::LocalTime;
 use curvine_runtime::runtime::{GroupExecutor, LoopTask};
-use log::{error, info, warn};
+use log::warn;
 use std::sync::Arc;
 
 pub struct HeartbeatChecker {
@@ -99,35 +99,12 @@ impl LoopTask for HeartbeatChecker {
                 "Worker {} ({}) last heartbeat {} has exceeded lost timeout {} ms and will be removed",
                 id, address, last_update, self.worker_lost_ms
             );
-            // Asynchronously delete all block location data.
-            let fs = self.fs.clone();
-            let rm = self.replication_manager.clone();
-            let res = self.executor.spawn(move || {
-                let spend = TimeSpent::new();
-                let cleanup = match fs.delete_locations(id) {
-                    Err(e) => {
-                        warn!("{}", curvine_core_error::err_msg!(e));
-                        Default::default()
-                    }
-                    Ok(res) => res,
-                };
-                let replication_block_num = cleanup.replication_block_ids.len();
-                if let Err(e) = rm.report_under_replicated_blocks(id, cleanup.replication_block_ids)
-                {
-                    error!(
-                        "Errors on reporting under-replicated {} blocks. err: {:?}",
-                        replication_block_num, e
-                    );
-                }
-                info!(
-                    "Delete worker {} all locations used {} ms",
-                    id,
-                    spend.used_ms()
-                );
-            });
-            if let Err(e) = &res {
-                warn!("{}", e);
-            }
+            schedule_worker_cleanup(
+                self.executor.clone(),
+                self.fs.clone(),
+                self.replication_manager.clone(),
+                id,
+            );
         }
 
         if let Ok(info) = self.fs.filesystem_info() {

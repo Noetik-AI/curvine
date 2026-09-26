@@ -36,6 +36,14 @@ pub struct WorkerManager {
     pub(crate) conf: ClusterConf,
 }
 
+#[derive(Default)]
+pub struct WorkerHeartbeatResult {
+    pub commands: Vec<WorkerCommand>,
+    /// Present only when an End heartbeat removed the same worker process
+    /// session that is currently registered on the master.
+    pub ended_worker_id: Option<u32>,
+}
+
 impl WorkerManager {
     pub fn new(conf: &ClusterConf) -> FsResult<Self> {
         let worker_policy = WorkerPolicyAdapter::from_conf(conf)?;
@@ -62,7 +70,7 @@ impl WorkerManager {
         startup_time_ms: u64,
         storages: Vec<StorageInfo>,
         component_info: Option<ComponentInfoProto>,
-    ) -> FsResult<Vec<WorkerCommand>> {
+    ) -> FsResult<WorkerHeartbeatResult> {
         // The cluster id must match to prevent misregistration.
         if cluster_id != self.cluster_id {
             return err_box!(
@@ -88,15 +96,31 @@ impl WorkerManager {
                 // Same node restarting: clear the slot so we do not treat it as ready or run
                 // Running heartbeat bookkeeping until insert() on the next Running beat.
                 self.worker_map.remove(&addr);
-                return Ok(vec![]);
+                return Ok(Default::default());
             }
 
             HeartbeatStatus::Running => self.block_map.handle_heartbeat(addr.worker_id),
 
             HeartbeatStatus::End => {
                 info!("Worker unregister: {}", addr);
-                let _ = self.worker_map.remove_offline(addr.worker_id);
-                return Ok(vec![]);
+                let ended_worker_id = self
+                    .worker_map
+                    .remove_offline(addr.worker_id)
+                    .and_then(|worker| {
+                        if worker.worker_session_id == worker_session_id {
+                            Some(addr.worker_id)
+                        } else {
+                            warn!(
+                                "Skip destructive cleanup for stale End heartbeat from worker {}: worker session does not match the registered session",
+                                addr.worker_id
+                            );
+                            None
+                        }
+                    });
+                return Ok(WorkerHeartbeatResult {
+                    ended_worker_id,
+                    ..Default::default()
+                });
             }
         };
 
@@ -111,7 +135,10 @@ impl WorkerManager {
             component_info,
         )?;
         self.expire_scheduled_bytes();
-        Ok(cmds)
+        Ok(WorkerHeartbeatResult {
+            commands: cmds,
+            ended_worker_id: None,
+        })
     }
 
     pub fn choose_worker(&mut self, ctx: ChooseContext) -> CommonResult<Vec<WorkerAddress>> {
@@ -423,6 +450,61 @@ mod tests {
             available,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn end_heartbeat_marks_matching_session_for_cleanup() {
+        let mut manager = robin_manager();
+        let mut worker = worker_with_available(7, 100);
+        worker.worker_session_id = "current-session".to_string();
+        let addr = worker.address.clone();
+        manager.add_test_worker(worker);
+
+        let cluster_id = manager.cluster_id.clone();
+        let result = manager
+            .heartbeat(
+                &cluster_id,
+                HeartbeatStatus::End,
+                addr,
+                1,
+                "current-session".to_string(),
+                TransferWorkerCapabilities::default(),
+                String::new(),
+                0,
+                vec![],
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(result.ended_worker_id, Some(7));
+        assert!(manager.get_worker(7).is_none());
+    }
+
+    #[test]
+    fn end_heartbeat_does_not_mark_replacement_session_for_cleanup() {
+        let mut manager = robin_manager();
+        let mut worker = worker_with_available(7, 100);
+        worker.worker_session_id = "replacement-session".to_string();
+        let addr = worker.address.clone();
+        manager.add_test_worker(worker);
+
+        let cluster_id = manager.cluster_id.clone();
+        let result = manager
+            .heartbeat(
+                &cluster_id,
+                HeartbeatStatus::End,
+                addr,
+                1,
+                "stale-session".to_string(),
+                TransferWorkerCapabilities::default(),
+                String::new(),
+                0,
+                vec![],
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(result.ended_worker_id, None);
     }
 
     #[test]

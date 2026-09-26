@@ -55,6 +55,10 @@ meta_dir = "testing/meta"
 # Worker selection policy: local, robin, random, load_based, or weighted.
 # local prefers a local worker for the first replica and assigns the rest via the weighted policy.
 # worker_policy = "weighted"
+# When enabled, an explicit worker End heartbeat immediately runs the same
+# block-location cleanup as a lost-worker heartbeat timeout. This is useful for
+# ephemeral workers that will not return with their existing local blocks.
+# worker_end_cleanup_enabled = false
 log = { level = "info", log_dir = "stdout", file_name = "master.log" }
 
 # Version compatibility policy.

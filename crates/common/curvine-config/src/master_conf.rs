@@ -80,6 +80,10 @@ pub struct MasterConf {
     #[serde(skip)]
     pub worker_lost_interval_unit: DurationUnit,
 
+    // Treat an explicit worker End heartbeat like a lost-worker timeout by
+    // removing its block locations and triggering cache/replica recovery.
+    pub worker_end_cleanup_enabled: bool,
+
     // Audit log configuration.
     pub audit_logging_enabled: bool,
     pub audit_log: LogConf,
@@ -302,6 +306,8 @@ impl Default for MasterConf {
             worker_lost_interval: "10m".to_string(),
             worker_lost_interval_unit: Default::default(),
 
+            worker_end_cleanup_enabled: false,
+
             audit_logging_enabled: true,
             audit_log: Default::default(),
 
@@ -350,5 +356,19 @@ impl Default for MasterConf {
 
         conf.init().unwrap();
         conf
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MasterConf;
+
+    #[test]
+    fn worker_end_cleanup_is_opt_in_and_parses_from_toml() {
+        assert!(!MasterConf::default().worker_end_cleanup_enabled);
+
+        let conf: MasterConf =
+            toml::from_str("worker_end_cleanup_enabled = true").expect("parse master config");
+        assert!(conf.worker_end_cleanup_enabled);
     }
 }

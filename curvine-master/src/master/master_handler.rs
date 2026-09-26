@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::master::fs::{FsRetryCache, MasterFilesystem, OperationStatus};
+use crate::master::fs::{
+    schedule_worker_cleanup, FsRetryCache, MasterFilesystem, OperationStatus, WorkerHeartbeatResult,
+};
 use crate::master::job::JobHandler;
 use crate::master::replication::master_replication_handler::MasterReplicationHandler;
 use crate::master::replication::master_replication_manager::MasterReplicationManager;
@@ -50,6 +52,7 @@ pub struct MasterHandler {
     pub(crate) mount_manager: Arc<MountManager>,
     pub(crate) control_rpc_executor: Arc<GroupExecutor>,
     pub(crate) replication_handler: Option<MasterReplicationHandler>,
+    pub(crate) replication_manager: Arc<MasterReplicationManager>,
     pub(crate) actor_rt: Arc<Runtime>,
     // Master's own version + compatibility contract, built once at startup.
     // GetFilesystemInfo backs statfs and is called frequently, so we reuse
@@ -99,7 +102,8 @@ impl MasterHandler {
             mount_manager,
             job_handler,
             control_rpc_executor,
-            replication_handler: Some(MasterReplicationHandler::new(replication_manager)),
+            replication_handler: Some(MasterReplicationHandler::new(replication_manager.clone())),
+            replication_manager,
             actor_rt,
             master_compatibility,
             compatibility_policy,
@@ -622,9 +626,19 @@ impl MasterHandler {
                 self.metrics,
             )?;
         }
-        let cmds = Self::process_worker_heartbeat(self.fs.clone(), header)?;
+        let result = Self::process_worker_heartbeat(self.fs.clone(), header)?;
+        if self.fs.conf.worker_end_cleanup_enabled {
+            if let Some(worker_id) = result.ended_worker_id {
+                schedule_worker_cleanup(
+                    self.control_rpc_executor.clone(),
+                    self.fs.clone(),
+                    self.replication_manager.clone(),
+                    worker_id,
+                );
+            }
+        }
         let rep_header = WorkerHeartbeatResponse {
-            cmds: ProtoUtils::worker_cmd_to_pb(cmds),
+            cmds: ProtoUtils::worker_cmd_to_pb(result.commands),
         };
         ctx.response(rep_header)
     }
@@ -733,7 +747,7 @@ impl MasterHandler {
     fn process_worker_heartbeat(
         fs: MasterFilesystem,
         header: WorkerHeartbeatRequest,
-    ) -> FsResult<Vec<WorkerCommand>> {
+    ) -> FsResult<WorkerHeartbeatResult> {
         let status = HeartbeatStatus::from(header.status);
         let address = ProtoUtils::worker_address_from_pb(&header.address);
         // Worker weight comes from trusted administrator configuration. Preserve the
@@ -744,7 +758,7 @@ impl MasterHandler {
         }
 
         let mut wm = fs.worker_manager.write();
-        let cmds = wm.heartbeat(
+        let result = wm.heartbeat(
             &header.cluster_id,
             status,
             address,
@@ -762,7 +776,7 @@ impl MasterHandler {
             ProtoUtils::storage_info_list_from_pb(header.storages),
             header.component_info,
         )?;
-        Ok(cmds)
+        Ok(result)
     }
 
     pub fn block_report(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
