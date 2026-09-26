@@ -13,10 +13,13 @@
 // limitations under the License.
 
 mod worker_manager;
-pub use self::worker_manager::WorkerManager;
+pub use self::worker_manager::{WorkerCleanupToken, WorkerHeartbeatResult, WorkerManager};
 
 mod heartbeat_checker;
 pub use self::heartbeat_checker::HeartbeatChecker;
+
+mod worker_cleanup;
+pub(crate) use self::worker_cleanup::schedule_worker_cleanup;
 
 mod fs_dir_watchdog;
 pub use self::fs_dir_watchdog::FsDirWatchdog;

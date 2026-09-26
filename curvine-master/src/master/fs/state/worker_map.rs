@@ -72,10 +72,15 @@ impl WorkerMap {
 
     pub fn ensure_worker_id_addr(&self, addr: &WorkerAddress) -> FsResult<()> {
         if let Some(v) = self.workers.get(&addr.worker_id) {
-            if v.address != *addr {
+            let registered = &v.address;
+            if registered.hostname != addr.hostname
+                || registered.ip_addr != addr.ip_addr
+                || registered.rpc_port != addr.rpc_port
+                || registered.web_port != addr.web_port
+            {
                 return err_box!(
                     "worker id addr mismatch,  expected {}, actual: {}",
-                    v.address,
+                    registered,
                     addr
                 );
             }
@@ -149,7 +154,7 @@ impl WorkerMap {
 
     // Delete the worker with heartbeat timeout
     pub fn remove_expired(&mut self, id: u32) -> Option<WorkerInfo> {
-        let worker = match self.workers.swap_remove(&id) {
+        let mut worker = match self.workers.swap_remove(&id) {
             None => {
                 warn!("Not found worker {}", id);
                 return None;
@@ -159,6 +164,7 @@ impl WorkerMap {
         };
 
         error!("remove expired worker {}", worker.address);
+        worker.status = WorkerStatus::Lost;
         self.lost_workers.insert(id, worker.clone());
         Some(worker)
     }

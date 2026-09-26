@@ -12,15 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::master::fs::MasterFilesystem;
+use crate::master::fs::{schedule_worker_cleanup, MasterFilesystem};
 use crate::master::quota::QuotaManager;
 use crate::master::replication::master_replication_manager::MasterReplicationManager;
 use crate::master::MasterMonitor;
 use curvine_error::FsError;
 use curvine_error::FsResult;
-use curvine_runtime::common::{LocalTime, TimeSpent};
+use curvine_runtime::common::LocalTime;
 use curvine_runtime::runtime::{GroupExecutor, LoopTask};
-use log::{error, info, warn};
+use log::warn;
 use std::sync::Arc;
 
 pub struct HeartbeatChecker {
@@ -65,10 +65,12 @@ impl LoopTask for HeartbeatChecker {
 
         let mut blacklisted_workers = Vec::new();
         let mut removed_workers = Vec::new();
+        let unverified_end_cleanups;
+        let pending_registration_candidates;
+        let now = LocalTime::mills();
         {
             let mut wm = self.fs.worker_manager.write();
             let workers = wm.get_last_heartbeat();
-            let now = LocalTime::mills();
 
             for (id, last_update) in workers {
                 if now > last_update + self.worker_blacklist_ms {
@@ -80,10 +82,29 @@ impl LoopTask for HeartbeatChecker {
 
                 if now > last_update + self.worker_lost_ms {
                     // Heartbeat timeout
-                    if let Some(worker) = wm.remove_expired_worker(id) {
-                        removed_workers.push((id, worker.address, worker.last_update));
+                    if let Some((worker, cleanup_token)) = wm.remove_expired_worker(id) {
+                        removed_workers.push((cleanup_token, worker.address, worker.last_update));
                     }
                 }
+            }
+            unverified_end_cleanups = wm.expire_unverified_worker_ends(now, self.worker_lost_ms);
+            pending_registration_candidates = wm.pending_registration_candidates();
+        }
+
+        let mut pending_registration_cleanups = Vec::new();
+        for (worker_id, last_activity_ms) in pending_registration_candidates {
+            if now.saturating_sub(last_activity_ms) < self.worker_lost_ms {
+                continue;
+            }
+            let lifecycle_lock = self.fs.worker_lifecycle_lock(worker_id);
+            let _lifecycle_guard = lifecycle_lock.lock();
+            if let Some(cleanup_token) = self
+                .fs
+                .worker_manager
+                .write()
+                .expire_pending_worker_session(worker_id, now, self.worker_lost_ms)
+            {
+                pending_registration_cleanups.push(cleanup_token);
             }
         }
 
@@ -94,40 +115,46 @@ impl LoopTask for HeartbeatChecker {
             );
         }
 
-        for (id, address, last_update) in removed_workers {
+        for (cleanup_token, address, last_update) in removed_workers {
+            let id = cleanup_token.worker_id();
             warn!(
                 "Worker {} ({}) last heartbeat {} has exceeded lost timeout {} ms and will be removed",
                 id, address, last_update, self.worker_lost_ms
             );
-            // Asynchronously delete all block location data.
-            let fs = self.fs.clone();
-            let rm = self.replication_manager.clone();
-            let res = self.executor.spawn(move || {
-                let spend = TimeSpent::new();
-                let cleanup = match fs.delete_locations(id) {
-                    Err(e) => {
-                        warn!("{}", curvine_core_error::err_msg!(e));
-                        Default::default()
-                    }
-                    Ok(res) => res,
-                };
-                let replication_block_num = cleanup.replication_block_ids.len();
-                if let Err(e) = rm.report_under_replicated_blocks(id, cleanup.replication_block_ids)
-                {
-                    error!(
-                        "Errors on reporting under-replicated {} blocks. err: {:?}",
-                        replication_block_num, e
-                    );
-                }
-                info!(
-                    "Delete worker {} all locations used {} ms",
-                    id,
-                    spend.used_ms()
-                );
-            });
-            if let Err(e) = &res {
-                warn!("{}", e);
-            }
+            schedule_worker_cleanup(
+                self.executor.clone(),
+                self.fs.clone(),
+                self.replication_manager.clone(),
+                cleanup_token,
+            );
+        }
+
+        for cleanup_token in unverified_end_cleanups {
+            let id = cleanup_token.worker_id();
+            warn!(
+                "Worker {} End was received without leader lifecycle state and remained unchallenged for {} ms; worker will be removed",
+                id, self.worker_lost_ms
+            );
+            schedule_worker_cleanup(
+                self.executor.clone(),
+                self.fs.clone(),
+                self.replication_manager.clone(),
+                cleanup_token,
+            );
+        }
+
+        for cleanup_token in pending_registration_cleanups {
+            let id = cleanup_token.worker_id();
+            warn!(
+                "Worker {} did not finish registration within {} ms; partial locations will be removed",
+                id, self.worker_lost_ms
+            );
+            schedule_worker_cleanup(
+                self.executor.clone(),
+                self.fs.clone(),
+                self.replication_manager.clone(),
+                cleanup_token,
+            );
         }
 
         if let Ok(info) = self.fs.filesystem_info() {

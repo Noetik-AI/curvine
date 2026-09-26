@@ -21,14 +21,14 @@ use curvine_model::MountOptions;
 use curvine_model::ProtoUtils;
 use curvine_model::{
     BlockLocation, BlockReportInfo, BlockReportList, BlockReportStatus, ClientAddress, CommitBlock,
-    CreateFileOpts, CreateFileOptsBuilder, DeleteResult, FileAllocOpts, LocatedBlock,
-    MkdirOptsBuilder, StorageType, TtlAction, WorkerAddress, WorkerInfo,
+    CreateFileOpts, CreateFileOptsBuilder, DeleteResult, FileAllocOpts, HeartbeatStatus,
+    LocatedBlock, MkdirOptsBuilder, StorageType, TtlAction, WorkerAddress, WorkerInfo,
 };
 use curvine_model::{OpenFlags, RenameFlags, SetAttrOptsBuilder};
 use curvine_proto::{
     BlockReportInfoProto, BlockReportListRequest, CompleteFileRequest, CompleteFileResponse,
     CreateFileRequest, DeleteRequest, GetFilesystemInfoRequest, MkdirOptsProto, MkdirRequest,
-    RenameRequest,
+    RenameRequest, WorkerHeartbeatRequest,
 };
 use curvine_raft::conf::JournalConf;
 use curvine_raft::raft::storage::{AppStorage, ApplyMsg};
@@ -48,7 +48,7 @@ use curvine_server::master::replication::master_replication_manager::MasterRepli
 use curvine_server::master::{JobHandler, JobManager, Master, MasterHandler, RpcContext};
 use prost::Message as ProtoMessage;
 use raft::eraftpb::Entry;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 #[cfg(feature = "fault-injection")]
@@ -209,11 +209,26 @@ fn prepare_flush_file(
 }
 
 fn new_handler_for_test(test_name: &str) -> MasterHandler {
+    new_handler_harness(test_name, false, String::new()).0
+}
+
+fn new_handler_harness(
+    test_name: &str,
+    worker_end_cleanup_enabled: bool,
+    worker_session_id: String,
+) -> (
+    MasterHandler,
+    MasterFilesystem,
+    Arc<GroupExecutor>,
+    ClusterConf,
+    WorkerAddress,
+) {
     Master::init_test_metrics();
 
     let test_id = Utils::rand_str(8);
     let mut conf = ClusterConf::format();
     conf.journal.enable = false;
+    conf.master.worker_end_cleanup_enabled = worker_end_cleanup_enabled;
 
     conf.master.meta_dir =
         Utils::test_sub_dir(format!("master-fs-test/meta-{test_name}-{test_id}"));
@@ -222,7 +237,12 @@ fn new_handler_for_test(test_name: &str) -> MasterHandler {
 
     let journal_system = JournalSystem::from_conf(&conf).unwrap();
     let fs = MasterFilesystem::with_js(&conf, &journal_system);
-    fs.add_test_worker(WorkerInfo::default());
+    let worker = WorkerInfo {
+        worker_session_id,
+        ..Default::default()
+    };
+    let worker_address = worker.address.clone();
+    fs.add_test_worker(worker);
     let retry_cache = FsRetryCache::with_conf(&conf.master)
         .expect("test master retry cache configuration should be valid");
 
@@ -238,18 +258,19 @@ fn new_handler_for_test(test_name: &str) -> MasterHandler {
         &conf,
     ));
     let control_rpc_executor = Arc::new(GroupExecutor::new("master-handler-test", 1, 16));
-    MasterHandler::new(
+    let handler = MasterHandler::new(
         &conf,
-        fs,
+        fs.clone(),
         retry_cache,
         None,
         mount_manager,
         JobHandler::new(job_manager),
-        control_rpc_executor,
+        control_rpc_executor.clone(),
         replication_manager,
         rt,
         Master::get_metrics().expect("test master metrics should initialize"),
-    )
+    );
+    (handler, fs, control_rpc_executor, conf, worker_address)
 }
 
 #[cfg(feature = "fault-injection")]
@@ -504,6 +525,8 @@ fn full_block_report_default_limit_to_master() -> CommonResult<()> {
         worker_id,
         full_report: true,
         total_len: count as u64,
+        worker_session_id: None,
+        worker_startup_time_ms: None,
         blocks: blocks
             .iter()
             .map(|block| BlockReportInfoProto {
@@ -654,6 +677,199 @@ fn create_ufs_backed_cache_file(
     fs.set_attr(path, SetAttrOptsBuilder::new().ufs_mtime(12_345).build())?;
 
     Ok((fs.file_status(path)?, block))
+}
+
+fn run_worker_end_cleanup_case(
+    test_name: &str,
+    cleanup_enabled: bool,
+    end_session_id: &str,
+    expect_cleanup: bool,
+    expect_worker_registered: bool,
+) -> CommonResult<()> {
+    let active_session_id = "current-session";
+    let (handler, fs, control_rpc_executor, conf, worker_address) =
+        new_handler_harness(test_name, cleanup_enabled, active_session_id.to_string());
+    let path = "/cached-file";
+    let (before, block) = create_ufs_backed_cache_file(&fs, path, TtlAction::Delete)?;
+    let worker_id = block.locs[0].worker_id;
+    assert_eq!(worker_address.worker_id, worker_id);
+
+    send_worker_heartbeat(
+        &handler,
+        &conf,
+        &worker_address,
+        HeartbeatStatus::End,
+        end_session_id,
+    )?;
+
+    // The test executor has one worker, so this sentinel runs after any queued cleanup.
+    control_rpc_executor.spawn_blocking(|| ())?;
+
+    let worker_blocks = fs.fs_dir.read().get_worker_block_ids(worker_id)?;
+    let after = fs.file_status(path)?;
+    if expect_cleanup {
+        assert!(!worker_blocks.contains(&block.block.id));
+        assert!(!after.cv_exists());
+        assert!(after.ufs_exists());
+        assert!(!after.cv_valid(None));
+    } else {
+        assert!(worker_blocks.contains(&block.block.id));
+        assert_eq!(after.storage_policy.state, before.storage_policy.state);
+        assert!(after.cv_valid(None));
+    }
+
+    assert_eq!(
+        fs.worker_manager.read().get_worker(worker_id).is_some(),
+        expect_worker_registered
+    );
+    Ok(())
+}
+
+fn send_worker_heartbeat(
+    handler: &MasterHandler,
+    conf: &ClusterConf,
+    worker_address: &WorkerAddress,
+    status: HeartbeatStatus,
+    worker_session_id: &str,
+) -> CommonResult<()> {
+    let request = Builder::new_rpc(RpcCode::WorkerHeartbeat)
+        .proto_header(WorkerHeartbeatRequest {
+            status: status.into(),
+            cluster_id: conf.cluster_id.clone(),
+            worker_id: worker_address.worker_id,
+            address: ProtoUtils::worker_address_to_pb(worker_address),
+            worker_session_id: Some(worker_session_id.to_string()),
+            fs_ctime: 123_456,
+            ..Default::default()
+        })
+        .build();
+    let mut ctx = RpcContext::new(&request);
+    let response = handler.worker_heartbeat(&mut ctx)?;
+    assert!(
+        response.is_success(),
+        "worker End failed: {}",
+        response.check_error_ext::<FsError>().unwrap_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn worker_end_cleanup_enabled_removes_matching_session_locations() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    run_worker_end_cleanup_case(
+        "worker-end-cleanup-enabled",
+        true,
+        "current-session",
+        true,
+        false,
+    )
+}
+
+#[test]
+fn worker_end_cleanup_disabled_preserves_matching_session_locations() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    run_worker_end_cleanup_case(
+        "worker-end-cleanup-disabled",
+        false,
+        "current-session",
+        false,
+        false,
+    )
+}
+
+#[test]
+fn worker_end_cleanup_ignores_mismatched_session() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    run_worker_end_cleanup_case(
+        "worker-end-cleanup-mismatch",
+        true,
+        "stale-session",
+        false,
+        true,
+    )
+}
+
+#[test]
+fn queued_worker_end_cleanup_preserves_replacement_report() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let (handler, fs, control_rpc_executor, conf, worker_address) = new_handler_harness(
+        "worker-end-cleanup-replacement",
+        true,
+        "ended-session".to_string(),
+    );
+    let path = "/cached-file";
+    let (_, block) = create_ufs_backed_cache_file(&fs, path, TtlAction::Delete)?;
+    let worker_id = block.locs[0].worker_id;
+
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    control_rpc_executor.spawn(move || {
+        entered_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+    })?;
+    entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+    send_worker_heartbeat(
+        &handler,
+        &conf,
+        &worker_address,
+        HeartbeatStatus::End,
+        "ended-session",
+    )?;
+    send_worker_heartbeat(
+        &handler,
+        &conf,
+        &worker_address,
+        HeartbeatStatus::Start,
+        "replacement-session",
+    )?;
+
+    let request = Builder::new_rpc(RpcCode::WorkerBlockReport)
+        .proto_header(BlockReportListRequest {
+            cluster_id: conf.cluster_id.clone(),
+            worker_id,
+            full_report: true,
+            total_len: 1,
+            blocks: vec![BlockReportInfoProto {
+                id: block.block.id,
+                status: BlockReportStatus::Finalized.into(),
+                block_size: block.block.len,
+                storage_type: block.storage_type.into(),
+            }],
+            worker_session_id: Some("replacement-session".to_string()),
+            worker_startup_time_ms: Some(123_456),
+        })
+        .build();
+    let mut ctx = RpcContext::new(&request);
+    let response = handler.block_report(&mut ctx)?;
+    assert!(response.is_success());
+
+    send_worker_heartbeat(
+        &handler,
+        &conf,
+        &worker_address,
+        HeartbeatStatus::Running,
+        "replacement-session",
+    )?;
+
+    release_tx.send(()).unwrap();
+    control_rpc_executor.spawn_blocking(|| ())?;
+
+    assert!(fs
+        .fs_dir
+        .read()
+        .get_worker_block_ids(worker_id)?
+        .contains(&block.block.id));
+    assert!(fs.file_status(path)?.cv_valid(None));
+    assert_eq!(
+        fs.worker_manager
+            .read()
+            .get_worker(worker_id)
+            .unwrap()
+            .worker_session_id,
+        "replacement-session"
+    );
+    Ok(())
 }
 
 #[test]

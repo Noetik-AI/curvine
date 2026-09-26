@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::master::fs::{FsRetryCache, MasterFilesystem, OperationStatus};
+use crate::master::fs::{
+    schedule_worker_cleanup, FsRetryCache, MasterFilesystem, OperationStatus, WorkerHeartbeatResult,
+};
 use crate::master::job::JobHandler;
 use crate::master::replication::master_replication_handler::MasterReplicationHandler;
 use crate::master::replication::master_replication_manager::MasterReplicationManager;
@@ -50,6 +52,7 @@ pub struct MasterHandler {
     pub(crate) mount_manager: Arc<MountManager>,
     pub(crate) control_rpc_executor: Arc<GroupExecutor>,
     pub(crate) replication_handler: Option<MasterReplicationHandler>,
+    pub(crate) replication_manager: Arc<MasterReplicationManager>,
     pub(crate) actor_rt: Arc<Runtime>,
     // Master's own version + compatibility contract, built once at startup.
     // GetFilesystemInfo backs statfs and is called frequently, so we reuse
@@ -99,7 +102,8 @@ impl MasterHandler {
             mount_manager,
             job_handler,
             control_rpc_executor,
-            replication_handler: Some(MasterReplicationHandler::new(replication_manager)),
+            replication_handler: Some(MasterReplicationHandler::new(replication_manager.clone())),
+            replication_manager,
             actor_rt,
             master_compatibility,
             compatibility_policy,
@@ -622,9 +626,21 @@ impl MasterHandler {
                 self.metrics,
             )?;
         }
-        let cmds = Self::process_worker_heartbeat(self.fs.clone(), header)?;
+        let result = Self::process_worker_heartbeat(self.fs.clone(), header)?;
+        if let Some(cleanup_token) = result.cleanup_token {
+            if self.fs.conf.worker_end_cleanup_enabled {
+                schedule_worker_cleanup(
+                    self.control_rpc_executor.clone(),
+                    self.fs.clone(),
+                    self.replication_manager.clone(),
+                    cleanup_token,
+                );
+            } else {
+                self.fs.worker_manager.write().finish_cleanup(cleanup_token);
+            }
+        }
         let rep_header = WorkerHeartbeatResponse {
-            cmds: ProtoUtils::worker_cmd_to_pb(cmds),
+            cmds: ProtoUtils::worker_cmd_to_pb(result.commands),
         };
         ctx.response(rep_header)
     }
@@ -733,36 +749,40 @@ impl MasterHandler {
     fn process_worker_heartbeat(
         fs: MasterFilesystem,
         header: WorkerHeartbeatRequest,
-    ) -> FsResult<Vec<WorkerCommand>> {
+    ) -> FsResult<WorkerHeartbeatResult> {
         let status = HeartbeatStatus::from(header.status);
         let address = ProtoUtils::worker_address_from_pb(&header.address);
+        let worker_id = address.worker_id;
+        let lifecycle_lock = fs.worker_lifecycle_lock(address.worker_id);
+        let _lifecycle_guard = lifecycle_lock.lock();
         // Worker weight comes from trusted administrator configuration. Preserve the
         // configured u32 value so the master does not silently alter allocation ratios.
         let weight = header.weight.unwrap_or_else(WorkerInfo::default_weight);
-        if matches!(status, HeartbeatStatus::Start) {
-            fs.reset_full_block_report(address.worker_id);
+        let result = {
+            let mut wm = fs.worker_manager.write();
+            wm.heartbeat(
+                &header.cluster_id,
+                status,
+                address,
+                weight,
+                header.worker_session_id.unwrap_or_default(),
+                curvine_model::TransferWorkerCapabilities {
+                    task_submit: header.transfer_task_submit.unwrap_or(false),
+                    report_target: header.transfer_report_target.unwrap_or(false),
+                    query_task: header.transfer_query_task.unwrap_or(false),
+                    attempt_safe_output: header.transfer_attempt_safe_output.unwrap_or(false),
+                    source_read_plan: header.transfer_source_read_plan.unwrap_or(false),
+                },
+                header.software_version,
+                u64::try_from(header.fs_ctime).unwrap_or_default(),
+                ProtoUtils::storage_info_list_from_pb(header.storages),
+                header.component_info,
+            )?
+        };
+        if result.reset_full_report {
+            fs.reset_full_block_report(worker_id);
         }
-
-        let mut wm = fs.worker_manager.write();
-        let cmds = wm.heartbeat(
-            &header.cluster_id,
-            status,
-            address,
-            weight,
-            header.worker_session_id.unwrap_or_default(),
-            curvine_model::TransferWorkerCapabilities {
-                task_submit: header.transfer_task_submit.unwrap_or(false),
-                report_target: header.transfer_report_target.unwrap_or(false),
-                query_task: header.transfer_query_task.unwrap_or(false),
-                attempt_safe_output: header.transfer_attempt_safe_output.unwrap_or(false),
-                source_read_plan: header.transfer_source_read_plan.unwrap_or(false),
-            },
-            header.software_version,
-            u64::try_from(header.fs_ctime).unwrap_or_default(),
-            ProtoUtils::storage_info_list_from_pb(header.storages),
-            header.component_info,
-        )?;
-        Ok(cmds)
+        Ok(result)
     }
 
     pub fn block_report(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
@@ -780,8 +800,44 @@ impl MasterHandler {
         replication_handler: Option<MasterReplicationHandler>,
         header: BlockReportListRequest,
     ) -> FsResult<Vec<WorkerCommand>> {
+        let worker_id = header.worker_id;
+        let worker_session_id = header.worker_session_id.clone().unwrap_or_default();
+        let worker_startup_time_ms = header.worker_startup_time_ms.unwrap_or_default();
+        if fs.conf.worker_end_cleanup_enabled && worker_session_id.is_empty() {
+            return err_box!(
+                "worker_session_id is required when master.worker_end_cleanup_enabled is true"
+            );
+        }
+        if fs.conf.worker_end_cleanup_enabled && worker_startup_time_ms == 0 {
+            return err_box!(
+                "worker_startup_time_ms is required when master.worker_end_cleanup_enabled is true"
+            );
+        }
+        let lifecycle_lock = fs.worker_lifecycle_lock(worker_id);
+        let _lifecycle_guard = lifecycle_lock.lock();
+        let session_result = fs.worker_manager.write().accept_block_report_session(
+            worker_id,
+            &worker_session_id,
+            worker_startup_time_ms,
+        );
+        if !session_result.accepted {
+            log::warn!(
+                "Ignore stale block report from worker {}: worker session does not match the active session",
+                worker_id
+            );
+            return Ok(Vec::new());
+        }
+        if session_result.reset_full_report {
+            fs.reset_full_block_report(worker_id);
+        }
+
         let list = ProtoUtils::block_report_list_from_pb(header);
         let result = fs.block_report(list, replication_handler)?;
+        fs.worker_manager.write().record_block_report_activity(
+            worker_id,
+            &worker_session_id,
+            worker_startup_time_ms,
+        );
 
         if result.delete_blocks.is_empty() {
             Ok(Vec::new())
@@ -1184,7 +1240,9 @@ impl MessageHandler for MasterHandler {
 mod tests {
     use super::*;
     use crate::master::journal::JournalSystem;
-    use curvine_model::WorkerAddress;
+    use curvine_model::{
+        BlockReportInfo, BlockReportList, BlockReportStatus, StorageType, WorkerAddress,
+    };
     use curvine_runtime::common::Utils;
 
     #[test]
@@ -1217,10 +1275,20 @@ mod tests {
             min_protocol_version: Some(1),
             capabilities: vec!["transfer".to_string()],
         };
+        let start_header = WorkerHeartbeatRequest {
+            status: HeartbeatStatus::Start.into(),
+            cluster_id: conf.cluster_id.clone(),
+            address: ProtoUtils::worker_address_to_pb(&address),
+            worker_session_id: Some("test-session".to_string()),
+            ..Default::default()
+        };
+        MasterHandler::process_worker_heartbeat(fs.clone(), start_header).unwrap();
+
         let header = WorkerHeartbeatRequest {
             status: HeartbeatStatus::Running.into(),
             cluster_id: conf.cluster_id.clone(),
             address: ProtoUtils::worker_address_to_pb(&address),
+            worker_session_id: Some("test-session".to_string()),
             software_version: "0.1.0-test".to_string(),
             fs_ctime: 123_456,
             component_info: Some(component_info.clone()),
@@ -1240,6 +1308,248 @@ mod tests {
         // Structured version metadata survives heartbeat -> WorkerInfo ->
         // WorkerInfoProto (filesystem_info) -> WorkerInfo round trip.
         assert_eq!(worker.component_info, Some(component_info));
+    }
+
+    #[test]
+    fn rejected_stale_start_preserves_in_progress_full_report() {
+        Master::init_test_metrics();
+        let test_name = Utils::rand_str(6);
+        let mut conf = ClusterConf::format();
+        conf.testing = true;
+        conf.journal.enable = false;
+        conf.master.worker_end_cleanup_enabled = true;
+        conf.master.meta_dir = Utils::test_sub_dir(format!("master-handler-test/meta-{test_name}"));
+        conf.journal.journal_dir =
+            Utils::test_sub_dir(format!("master-handler-test/journal-{test_name}"));
+        let fs = JournalSystem::fs_only_for_test(&conf).unwrap();
+        let address = WorkerAddress {
+            worker_id: 7,
+            ..Default::default()
+        };
+
+        let accepted_start = WorkerHeartbeatRequest {
+            status: HeartbeatStatus::Start.into(),
+            cluster_id: conf.cluster_id.clone(),
+            address: ProtoUtils::worker_address_to_pb(&address),
+            worker_session_id: Some("replacement-session".to_string()),
+            fs_ctime: 200,
+            ..Default::default()
+        };
+        assert!(
+            MasterHandler::process_worker_heartbeat(fs.clone(), accepted_start)
+                .unwrap()
+                .reset_full_report
+        );
+
+        fs.block_report(
+            BlockReportList {
+                cluster_id: conf.cluster_id.clone(),
+                worker_id: address.worker_id,
+                full_report: true,
+                total_len: 2,
+                blocks: vec![BlockReportInfo::new(
+                    1,
+                    BlockReportStatus::Finalized,
+                    StorageType::Disk,
+                    1,
+                )],
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(fs.pending_full_block_report_len(address.worker_id), Some(1));
+
+        let stale_start = WorkerHeartbeatRequest {
+            status: HeartbeatStatus::Start.into(),
+            cluster_id: conf.cluster_id.clone(),
+            address: ProtoUtils::worker_address_to_pb(&address),
+            worker_session_id: Some("stale-session".to_string()),
+            fs_ctime: 100,
+            ..Default::default()
+        };
+        assert!(
+            !MasterHandler::process_worker_heartbeat(fs.clone(), stale_start)
+                .unwrap()
+                .reset_full_report
+        );
+        assert_eq!(fs.pending_full_block_report_len(address.worker_id), Some(1));
+    }
+
+    #[test]
+    fn legacy_restart_resets_in_progress_full_report() {
+        Master::init_test_metrics();
+        let test_name = Utils::rand_str(6);
+        let mut conf = ClusterConf::format();
+        conf.testing = true;
+        conf.journal.enable = false;
+        conf.master.meta_dir = Utils::test_sub_dir(format!("master-handler-test/meta-{test_name}"));
+        conf.journal.journal_dir =
+            Utils::test_sub_dir(format!("master-handler-test/journal-{test_name}"));
+        let fs = JournalSystem::fs_only_for_test(&conf).unwrap();
+        let address = WorkerAddress {
+            worker_id: 7,
+            ..Default::default()
+        };
+        let start = |startup_time_ms| WorkerHeartbeatRequest {
+            status: HeartbeatStatus::Start.into(),
+            cluster_id: conf.cluster_id.clone(),
+            address: ProtoUtils::worker_address_to_pb(&address),
+            worker_session_id: Some(String::new()),
+            fs_ctime: startup_time_ms,
+            ..Default::default()
+        };
+
+        assert!(
+            MasterHandler::process_worker_heartbeat(fs.clone(), start(100))
+                .unwrap()
+                .reset_full_report
+        );
+        fs.block_report(
+            BlockReportList {
+                cluster_id: conf.cluster_id.clone(),
+                worker_id: address.worker_id,
+                full_report: true,
+                total_len: 2,
+                blocks: vec![BlockReportInfo::new(
+                    1,
+                    BlockReportStatus::Finalized,
+                    StorageType::Disk,
+                    1,
+                )],
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(fs.pending_full_block_report_len(address.worker_id), Some(1));
+
+        assert!(
+            !MasterHandler::process_worker_heartbeat(fs.clone(), start(100))
+                .unwrap()
+                .reset_full_report
+        );
+        assert_eq!(fs.pending_full_block_report_len(address.worker_id), Some(1));
+
+        assert!(
+            MasterHandler::process_worker_heartbeat(fs.clone(), start(200))
+                .unwrap()
+                .reset_full_report
+        );
+        assert_eq!(fs.pending_full_block_report_len(address.worker_id), None);
+    }
+
+    #[test]
+    fn newer_report_replaces_failover_guess_and_resets_partial_report() {
+        Master::init_test_metrics();
+        let test_name = Utils::rand_str(6);
+        let mut conf = ClusterConf::format();
+        conf.testing = true;
+        conf.journal.enable = false;
+        conf.master.worker_end_cleanup_enabled = true;
+        conf.master.meta_dir = Utils::test_sub_dir(format!("master-handler-test/meta-{test_name}"));
+        conf.journal.journal_dir =
+            Utils::test_sub_dir(format!("master-handler-test/journal-{test_name}"));
+        let fs = JournalSystem::fs_only_for_test(&conf).unwrap();
+        let address = WorkerAddress {
+            worker_id: 7,
+            ..Default::default()
+        };
+
+        MasterHandler::process_worker_heartbeat(
+            fs.clone(),
+            WorkerHeartbeatRequest {
+                status: HeartbeatStatus::Running.into(),
+                cluster_id: conf.cluster_id.clone(),
+                address: ProtoUtils::worker_address_to_pb(&address),
+                worker_session_id: Some("stale-session".to_string()),
+                fs_ctime: 100,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let report = |session: &str, startup_time_ms, block_id| BlockReportListRequest {
+            cluster_id: conf.cluster_id.clone(),
+            worker_id: address.worker_id,
+            full_report: true,
+            total_len: 2,
+            blocks: vec![BlockReportInfoProto {
+                id: block_id,
+                status: BlockReportStatus::Finalized.into(),
+                storage_type: StorageType::Disk.into(),
+                block_size: 1,
+            }],
+            worker_session_id: Some(session.to_string()),
+            worker_startup_time_ms: Some(startup_time_ms),
+        };
+
+        MasterHandler::process_block_report(fs.clone(), None, report("stale-session", 100, 1))
+            .unwrap();
+        assert_eq!(fs.pending_full_block_report_len(address.worker_id), Some(1));
+
+        MasterHandler::process_block_report(
+            fs.clone(),
+            None,
+            report("replacement-session", 200, 2),
+        )
+        .unwrap();
+        assert_eq!(fs.pending_full_block_report_len(address.worker_id), Some(1));
+        assert!(fs
+            .worker_manager
+            .read()
+            .get_worker(address.worker_id)
+            .is_none());
+        assert!(
+            fs.worker_manager
+                .write()
+                .accept_block_report_session(address.worker_id, "replacement-session", 200)
+                .accepted
+        );
+    }
+
+    #[test]
+    fn process_block_report_requires_session_when_end_cleanup_is_enabled() {
+        Master::init_test_metrics();
+        let test_name = Utils::rand_str(6);
+        let mut conf = ClusterConf::format();
+        conf.testing = true;
+        conf.journal.enable = false;
+        conf.master.worker_end_cleanup_enabled = true;
+        conf.master.meta_dir = Utils::test_sub_dir(format!("master-handler-test/meta-{test_name}"));
+        conf.journal.journal_dir =
+            Utils::test_sub_dir(format!("master-handler-test/journal-{test_name}"));
+        let fs = JournalSystem::fs_only_for_test(&conf).unwrap();
+
+        let result = MasterHandler::process_block_report(
+            fs.clone(),
+            None,
+            BlockReportListRequest {
+                worker_id: 7,
+                ..Default::default()
+            },
+        );
+
+        let error = match result {
+            Ok(_) => panic!("legacy block report should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("worker_session_id is required"));
+
+        let result = MasterHandler::process_block_report(
+            fs,
+            None,
+            BlockReportListRequest {
+                worker_id: 7,
+                worker_session_id: Some("session".to_string()),
+                ..Default::default()
+            },
+        );
+        let error = match result {
+            Ok(_) => panic!("block report without startup time should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("worker_startup_time_ms is required"));
     }
 
     #[test]

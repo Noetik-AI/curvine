@@ -1,6 +1,6 @@
 use curvine_proto::{
-    ComponentInfoProto, HeartbeatStatusProto, WorkerAddressProto, WorkerHeartbeatRequest,
-    WorkerInfoProto,
+    BlockReportListRequest, ComponentInfoProto, HeartbeatStatusProto, WorkerAddressProto,
+    WorkerHeartbeatRequest, WorkerInfoProto,
 };
 use prost::Message;
 
@@ -46,6 +46,18 @@ struct LegacyWorkerHeartbeatRequest {
     status: i32,
     #[prost(string, required, tag = "7")]
     software_version: String,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+struct LegacyBlockReportListRequest {
+    #[prost(string, required, tag = "1")]
+    cluster_id: String,
+    #[prost(uint32, required, tag = "2")]
+    worker_id: u32,
+    #[prost(bool, required, tag = "3")]
+    full_report: bool,
+    #[prost(uint64, required, tag = "4")]
+    total_len: u64,
 }
 
 /// Append a raw varint field (field number, wire type 0) to a wire buffer.
@@ -127,6 +139,40 @@ fn test_worker_heartbeat_legacy_empty_decodes() {
     assert_eq!(decoded.address.worker_id, 7);
     assert_eq!(decoded.failed_dirs, 0);
     assert_eq!(decoded.status, HeartbeatStatusProto::Running as i32);
+}
+
+#[test]
+fn test_block_report_legacy_request_decodes_without_session() {
+    let legacy = LegacyBlockReportListRequest {
+        cluster_id: "test-cluster".to_string(),
+        worker_id: 7,
+        full_report: true,
+        total_len: 0,
+    };
+
+    let decoded = BlockReportListRequest::decode(legacy.encode_to_vec().as_slice()).unwrap();
+    assert_eq!(decoded.worker_id, 7);
+    assert_eq!(decoded.worker_session_id, None);
+    assert_eq!(decoded.worker_startup_time_ms, None);
+}
+
+#[test]
+fn test_block_report_session_is_ignored_by_legacy_master() {
+    let current = BlockReportListRequest {
+        cluster_id: "test-cluster".to_string(),
+        worker_id: 7,
+        full_report: true,
+        total_len: 0,
+        worker_session_id: Some("worker-session".to_string()),
+        worker_startup_time_ms: Some(123_456),
+        blocks: Vec::new(),
+    };
+
+    let encoded = current.encode_to_vec();
+    let current_decoded = BlockReportListRequest::decode(encoded.as_slice()).unwrap();
+    assert_eq!(current_decoded.worker_startup_time_ms, Some(123_456));
+    let decoded = LegacyBlockReportListRequest::decode(encoded.as_slice()).unwrap();
+    assert_eq!(decoded.worker_id, 7);
 }
 
 #[test]
