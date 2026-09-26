@@ -833,6 +833,11 @@ impl MasterHandler {
 
         let list = ProtoUtils::block_report_list_from_pb(header);
         let result = fs.block_report(list, replication_handler)?;
+        fs.worker_manager.write().record_block_report_activity(
+            worker_id,
+            &worker_session_id,
+            worker_startup_time_ms,
+        );
 
         if result.delete_blocks.is_empty() {
             Ok(Vec::new())

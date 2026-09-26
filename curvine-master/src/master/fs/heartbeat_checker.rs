@@ -66,10 +66,11 @@ impl LoopTask for HeartbeatChecker {
         let mut blacklisted_workers = Vec::new();
         let mut removed_workers = Vec::new();
         let unverified_end_cleanups;
+        let pending_registration_candidates;
+        let now = LocalTime::mills();
         {
             let mut wm = self.fs.worker_manager.write();
             let workers = wm.get_last_heartbeat();
-            let now = LocalTime::mills();
 
             for (id, last_update) in workers {
                 if now > last_update + self.worker_blacklist_ms {
@@ -87,6 +88,24 @@ impl LoopTask for HeartbeatChecker {
                 }
             }
             unverified_end_cleanups = wm.expire_unverified_worker_ends(now, self.worker_lost_ms);
+            pending_registration_candidates = wm.pending_registration_candidates();
+        }
+
+        let mut pending_registration_cleanups = Vec::new();
+        for (worker_id, last_activity_ms) in pending_registration_candidates {
+            if now.saturating_sub(last_activity_ms) < self.worker_lost_ms {
+                continue;
+            }
+            let lifecycle_lock = self.fs.worker_lifecycle_lock(worker_id);
+            let _lifecycle_guard = lifecycle_lock.lock();
+            if let Some(cleanup_token) = self
+                .fs
+                .worker_manager
+                .write()
+                .expire_pending_worker_session(worker_id, now, self.worker_lost_ms)
+            {
+                pending_registration_cleanups.push(cleanup_token);
+            }
         }
 
         for (id, address, last_update) in blacklisted_workers {
@@ -114,6 +133,20 @@ impl LoopTask for HeartbeatChecker {
             let id = cleanup_token.worker_id();
             warn!(
                 "Worker {} End was received without leader lifecycle state and remained unchallenged for {} ms; worker will be removed",
+                id, self.worker_lost_ms
+            );
+            schedule_worker_cleanup(
+                self.executor.clone(),
+                self.fs.clone(),
+                self.replication_manager.clone(),
+                cleanup_token,
+            );
+        }
+
+        for cleanup_token in pending_registration_cleanups {
+            let id = cleanup_token.worker_id();
+            warn!(
+                "Worker {} did not finish registration within {} ms; partial locations will be removed",
                 id, self.worker_lost_ms
             );
             schedule_worker_cleanup(

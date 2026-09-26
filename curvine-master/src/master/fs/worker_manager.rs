@@ -60,6 +60,7 @@ struct WorkerSessionState {
     startup_time_ms: u64,
     generation: u64,
     reconstructed_after_failover: bool,
+    last_activity_ms: u64,
     ended: bool,
     cleanup_pending: bool,
     retain_after_cleanup: bool,
@@ -121,6 +122,7 @@ impl WorkerManager {
                 startup_time_ms,
                 generation,
                 reconstructed_after_failover: false,
+                last_activity_ms: LocalTime::mills(),
                 ended: false,
                 cleanup_pending: false,
                 retain_after_cleanup: false,
@@ -343,6 +345,7 @@ impl WorkerManager {
                 startup_time_ms: tracked_startup_time_ms,
                 generation,
                 reconstructed_after_failover: false,
+                last_activity_ms: LocalTime::mills(),
                 ended: true,
                 cleanup_pending: !untracked_failover_end,
                 retain_after_cleanup: untracked_failover_end,
@@ -397,6 +400,55 @@ impl WorkerManager {
             }
         }
         cleanup_tokens
+    }
+
+    pub(crate) fn pending_registration_candidates(&self) -> Vec<(u32, u64)> {
+        self.worker_sessions
+            .iter()
+            .filter(|(worker_id, session)| {
+                !session.ended
+                    && !self.worker_map.workers.contains_key(*worker_id)
+                    && !self.worker_map.lost_workers.contains_key(*worker_id)
+            })
+            .map(|(worker_id, session)| (*worker_id, session.last_activity_ms))
+            .collect()
+    }
+
+    pub(crate) fn expire_pending_worker_session(
+        &mut self,
+        worker_id: u32,
+        now_ms: u64,
+        grace_ms: u64,
+    ) -> Option<WorkerCleanupToken> {
+        let expired = self
+            .worker_sessions
+            .get(&worker_id)
+            .map(|session| {
+                !session.ended
+                    && !self.worker_map.workers.contains_key(&worker_id)
+                    && !self.worker_map.lost_workers.contains_key(&worker_id)
+                    && now_ms.saturating_sub(session.last_activity_ms) >= grace_ms
+            })
+            .unwrap_or(false);
+        if !expired {
+            return None;
+        }
+
+        if !self.conf.master.worker_end_cleanup_enabled {
+            // Session tracking is new metadata. Preserve disabled-mode behavior by
+            // retiring the tracker without deleting legacy partial locations.
+            self.worker_sessions.remove(&worker_id);
+            return None;
+        }
+
+        let session = self.worker_sessions.get_mut(&worker_id)?;
+        session.ended = true;
+        session.cleanup_pending = true;
+        session.retain_after_cleanup = true;
+        Some(WorkerCleanupToken {
+            worker_id,
+            generation: session.generation,
+        })
     }
 
     fn prune_completed_worker_session_tombstones(&mut self) {
@@ -480,6 +532,9 @@ impl WorkerManager {
                 && reconstructed_after_failover
                 && self.is_recoverable_timeout_session(worker_id, &tracked_session_id);
             if !ended && matches {
+                if let Some(session) = self.worker_sessions.get_mut(&worker_id) {
+                    session.last_activity_ms = LocalTime::mills();
+                }
                 return BlockReportSessionResult {
                     accepted: true,
                     reset_full_report: false,
@@ -561,6 +616,23 @@ impl WorkerManager {
         BlockReportSessionResult {
             accepted: true,
             reset_full_report: false,
+        }
+    }
+
+    pub(crate) fn record_block_report_activity(
+        &mut self,
+        worker_id: u32,
+        session_id: &str,
+        startup_time_ms: u64,
+    ) {
+        if let Some(session) = self.worker_sessions.get_mut(&worker_id) {
+            let session_matches = session.session_id == session_id
+                && (startup_time_ms == 0
+                    || session.startup_time_ms == 0
+                    || session.startup_time_ms == startup_time_ms);
+            if !session.ended && session_matches {
+                session.last_activity_ms = LocalTime::mills();
+            }
         }
     }
 
@@ -862,6 +934,7 @@ impl WorkerManager {
                         startup_time_ms: worker.startup_time_ms,
                         generation,
                         reconstructed_after_failover: false,
+                        last_activity_ms: LocalTime::mills(),
                         ended: true,
                         cleanup_pending: true,
                         retain_after_cleanup: false,
@@ -1245,6 +1318,64 @@ mod tests {
             )
             .unwrap();
         assert!(manager.get_worker(7).is_none());
+    }
+
+    #[test]
+    fn pending_registration_activity_refreshes_and_eventually_expires() {
+        let mut manager = robin_manager();
+        manager.conf.master.worker_end_cleanup_enabled = true;
+        let addr = WorkerAddress {
+            worker_id: 7,
+            ..Default::default()
+        };
+        let cluster_id = manager.cluster_id.clone();
+
+        manager
+            .heartbeat(
+                &cluster_id,
+                HeartbeatStatus::Start,
+                addr,
+                1,
+                "starting-session".to_string(),
+                TransferWorkerCapabilities::default(),
+                String::new(),
+                100,
+                vec![],
+                None,
+            )
+            .unwrap();
+        manager
+            .worker_sessions
+            .get_mut(&7)
+            .unwrap()
+            .last_activity_ms = 100;
+
+        assert!(
+            manager
+                .accept_block_report_session(7, "starting-session", 100)
+                .accepted
+        );
+        let report_start_activity = manager.worker_sessions.get(&7).unwrap().last_activity_ms;
+        assert!(report_start_activity > 100);
+
+        manager
+            .worker_sessions
+            .get_mut(&7)
+            .unwrap()
+            .last_activity_ms = 100;
+        manager.record_block_report_activity(7, "starting-session", 100);
+        let report_finish_activity = manager.worker_sessions.get(&7).unwrap().last_activity_ms;
+        assert!(report_finish_activity > 100);
+        assert!(manager
+            .expire_pending_worker_session(7, report_finish_activity + 99, 100)
+            .is_none());
+
+        let cleanup_token = manager
+            .expire_pending_worker_session(7, report_finish_activity + 100, 100)
+            .unwrap();
+        assert!(manager.is_cleanup_current(cleanup_token));
+        manager.finish_cleanup(cleanup_token);
+        assert!(manager.worker_sessions.get(&7).unwrap().ended);
     }
 
     #[test]
