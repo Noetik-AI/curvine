@@ -30,6 +30,7 @@ pub struct ClientMetrics {
     pub mount_cache_hits: CounterVec,
     pub mount_cache_misses: CounterVec,
     pub async_cache_admission_skipped: CounterVec,
+    pub block_location_cache: CounterVec,
     pub last_value_map: FastDashMap<String, f64>,
 
     pub metadata_operation_duration: HistogramVec,
@@ -61,6 +62,12 @@ impl ClientMetrics {
                 "client_async_cache_admission_skipped",
                 "auto-cache admission requests skipped by reason",
                 &["reason"],
+            )?,
+
+            block_location_cache: m::new_counter_vec(
+                "client_block_location_cache",
+                "block location lookups by result: hit, miss, or refresh after a failed read",
+                &["result"],
             )?,
 
             last_value_map: FastDashMap::default(),

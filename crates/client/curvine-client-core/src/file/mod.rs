@@ -33,6 +33,9 @@ pub use self::fs_writer_base::FsWriterBase;
 mod fs_writer;
 pub use self::fs_writer::FsWriter;
 
+mod block_location_cache;
+pub use self::block_location_cache::BlockLocationCache;
+
 mod fs_context;
 pub use self::fs_context::FsContext;
 
