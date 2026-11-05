@@ -20,7 +20,7 @@ use curvine_error::FsResult;
 use curvine_error::{ErrorKind, FsError};
 use curvine_fs_api::Path;
 use curvine_io::DataSlice;
-use curvine_model::FileBlocks;
+use curvine_model::{FileBlocks, SearchFileBlocks};
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use curvine_runtime::sync::channel::{
     AsyncChannel, AsyncReceiver, AsyncSender, CallChannel, CallSender,
@@ -167,7 +167,15 @@ impl BufferChannel {
         if self.fail_seek {
             return err_box!("injected lane seek failure for tests");
         }
-        self.start_prefetch();
+        // A lane that has not started has nothing queued: reposition its reader
+        // in place. Starting the task only to park it races the park, and a task
+        // that runs first opens a block at its old position for nothing.
+        if let Some(args) = self.prefetch.as_mut() {
+            args.reader.seek(pos).await?;
+            self.produced_end.store(0, Ordering::Release);
+            self.needs_drain = false;
+            return Ok(());
+        }
 
         let fun = async {
             // Notify seek and seek will pause data reading.
@@ -216,9 +224,10 @@ impl BufferChannel {
         self.ctx.call("complete", fun).await
     }
 
-    async fn pause(&self, pos: i64, pause: bool) -> FsResult<()> {
-        if self.prefetch.is_some() {
-            return Ok(());
+    async fn pause(&mut self, pos: i64, pause: bool) -> FsResult<()> {
+        // Not started: position the reader so the first read starts from `pos`.
+        if let Some(args) = self.prefetch.as_mut() {
+            return args.reader.seek(pos).await;
         }
         let fun = async { self.task_sender.send(ReadTask::Pause((pos, pause))).await };
         self.ctx.call("pause", fun).await
@@ -275,6 +284,14 @@ pub struct FsReaderBuffer {
     read_end: Arc<AtomicI64>,
 
     read_detector: ReadDetector,
+    // Block layout, to find where the block being read ends.
+    file_blocks: SearchFileBlocks,
+    // Set when the detector turns sequential while the base reader is serving:
+    // the base reader keeps serving until this offset (the end of its current
+    // block) and the lanes take over there. Switching mid-block would make a
+    // lane open the block the base reader already has open, so a 1-2 MB ranged
+    // read would open and commit its block twice.
+    switch_at: Option<i64>,
 }
 
 impl FsReaderBuffer {
@@ -297,6 +314,7 @@ impl FsReaderBuffer {
         let len = file_blocks.status.len;
         let read_end = Arc::new(AtomicI64::new(len));
 
+        let layout = SearchFileBlocks::new(file_blocks.clone());
         let base = FsReaderParallel::from_base(
             FsReaderBase::new(
                 path.clone(),
@@ -362,6 +380,8 @@ impl FsReaderBuffer {
             absorb_window,
             read_end,
             read_detector,
+            file_blocks: layout,
+            switch_at: None,
         };
         Ok(reader)
     }
@@ -414,9 +434,27 @@ impl FsReaderBuffer {
         Some((pos / slice_size % read_parallel) as usize)
     }
 
+    /// End offset of the block holding `pos`, clamped to the file length.
+    fn block_end(&self, pos: i64) -> i64 {
+        match self.file_blocks.get_read_block(pos) {
+            Ok((block_off, loc)) => (pos - block_off + loc.block.len).min(self.len),
+            Err(_) => self.len,
+        }
+    }
+
+    /// Hand reads from the base reader to the lanes at `self.pos`.
+    async fn resume_lanes(&mut self) -> FsResult<()> {
+        self.switch_at = None;
+        for reader in &mut self.readers {
+            reader.pause(self.pos, false).await?;
+        }
+        Ok(())
+    }
+
     fn get_reader(&mut self) -> FsResult<&mut ReaderAdapter> {
         let Some(id) = Self::select_reader_index(
-            self.read_detector.is_random(),
+            // A pending switch keeps the base reader until its block ends.
+            self.read_detector.is_random() || self.switch_at.is_some(),
             self.pos,
             self.slice_size,
             self.read_detector.read_parallel(),
@@ -440,6 +478,10 @@ impl FsReaderBuffer {
     pub async fn read(&mut self) -> FsResult<DataSlice> {
         if !self.has_remaining() {
             return Ok(DataSlice::Empty);
+        }
+
+        if self.switch_at.is_some_and(|at| self.pos >= at) {
+            self.resume_lanes().await?;
         }
 
         let pos = self.pos;
@@ -471,8 +513,13 @@ impl FsReaderBuffer {
             .record_read(start_pos, self.pos, &self.path);
 
         if is_changed && self.read_detector.is_sequential() {
-            for reader in &mut self.readers {
-                reader.pause(self.pos, false).await?;
+            // The base reader served these bytes (the pattern was random). Let it
+            // finish its block rather than reopening the block in a lane.
+            let at = self.block_end(start_pos);
+            if self.pos >= at {
+                self.resume_lanes().await?;
+            } else {
+                self.switch_at = Some(at);
             }
         }
 
@@ -485,6 +532,8 @@ impl FsReaderBuffer {
         if !self.read_detector.enabled
             || self.absorb_window <= 0
             || pos - self.pos > self.absorb_window
+            // Lanes are not serving yet: there is nothing in them to absorb.
+            || self.switch_at.is_some()
         {
             return false;
         }
@@ -511,7 +560,9 @@ impl FsReaderBuffer {
         let Some(ReaderAdapter::Buffer(ch)) = self.readers.get_mut(id) else {
             return false;
         };
-        ch.start_prefetch();
+        // No `start_prefetch` here: an unstarted lane's watermark is 0, so it
+        // refuses absorption on its own, and starting it would only open a
+        // block early. A lane that does absorb is started by its next read.
         let absorbed = ch.can_absorb(pos);
         if absorbed {
             ch.mark_absorbed();
@@ -545,6 +596,8 @@ impl FsReaderBuffer {
         // leaves lanes holding stale data through the Random phase, and the
         // next read after flip-back pops a chunk with off > pos -> EIO
         // (reachable with the default window=0 config).
+        // A seek supersedes a pending switch; the loop below repositions lanes.
+        self.switch_at = None;
         let was_random = self.read_detector.is_random();
         self.read_detector.record_seek(&self.path);
         if self.read_detector.enabled && was_random && self.absorb_window > 0 {
