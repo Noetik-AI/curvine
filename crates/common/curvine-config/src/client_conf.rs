@@ -89,6 +89,19 @@ pub struct ClientConf {
     #[client_cli]
     pub max_cache_block_handles: usize,
 
+    // How long a file's block locations are reused across opens, in
+    // milliseconds, so reading a file again skips the master round trip.
+    // Only safe for data that is never rewritten in place: a cached file
+    // that is deleted, overwritten or appended to keeps serving its old
+    // blocks until the entry expires. A read that fails on cached
+    // locations refetches them once. 0 (the default) disables the cache.
+    #[serde(alias = "block_location_cache_ttl")]
+    #[client_cli]
+    pub block_location_cache_ttl_ms: u64,
+    // Maximum number of files whose block locations are cached.
+    #[client_cli]
+    pub block_location_cache_capacity: u64,
+
     #[client_cli]
     pub short_circuit: bool,
 
@@ -476,6 +489,8 @@ impl Default for ClientConf {
             read_slice_size: 0,
             read_slice_size_str: "0".to_owned(),
             max_cache_block_handles: 10,
+            block_location_cache_ttl_ms: 0,
+            block_location_cache_capacity: 100_000,
 
             short_circuit: true,
             alloc_first_block_on_create: true,

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::block::{BlockClient, BlockClientPool};
-use crate::file::{FsClient, MasterHandshake, WorkerPrecheck};
+use crate::file::{BlockLocationCache, FsClient, MasterHandshake, WorkerPrecheck};
 use crate::ClientMetrics;
 use curvine_config::ClusterConf;
 use curvine_error::{FsError, FsResult};
@@ -53,6 +53,8 @@ pub struct FsContext {
     pub(crate) os_cache: CacheManager,
     pub(crate) failed_workers: Cache<u32, WorkerAddress, BuildHasherDefault<FxHasher>>,
     pub(crate) block_pool: Arc<BlockClientPool>,
+    // Block locations reused across opens; `None` unless enabled in the conf.
+    block_locations: Option<BlockLocationCache>,
     // Client-master handshake result: the master's advertised version /
     // protocol / capabilities (or a legacy marker when the master does not
     // advertise a compatibility contract). Populated by the first
@@ -131,6 +133,8 @@ impl FsContext {
             conf.client.block_conn_idle_time_ms,
         ));
 
+        let block_locations = BlockLocationCache::with_conf(&conf.client);
+
         let context = Self {
             conf,
             connector: Arc::new(connector),
@@ -138,6 +142,7 @@ impl FsContext {
             os_cache,
             failed_workers: exclude_workers,
             block_pool,
+            block_locations,
             master_handshake: FastRwLock::new(MasterHandshake::default()),
             live_workers: FastRwLock::new(HashMap::new()),
             worker_precheck: FastRwLock::new(WorkerPrecheck::default()),
@@ -304,6 +309,10 @@ impl FsContext {
 
     pub fn rpc_conf(&self) -> &ClientConf {
         self.connector.factory().conf()
+    }
+
+    pub fn block_location_cache(&self) -> Option<&BlockLocationCache> {
+        self.block_locations.as_ref()
     }
 
     pub fn clone_os_cache(&self) -> CacheManager {

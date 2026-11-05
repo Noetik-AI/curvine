@@ -744,6 +744,25 @@ impl FsClient {
         Ok(res)
     }
 
+    /// `get_block_locations` for opening `path` to read, served from the
+    /// block-location cache when it is enabled.
+    pub async fn get_read_block_locations(&self, path: &Path) -> FsResult<FileBlocks> {
+        let Some(cache) = self.context.block_location_cache() else {
+            return self.get_block_locations(path).await;
+        };
+
+        let lookups = &FsContext::get_metrics().block_location_cache;
+        if let Some(blocks) = cache.get(path) {
+            lookups.with_label_values(&["hit"]).inc();
+            return Ok(blocks);
+        }
+
+        lookups.with_label_values(&["miss"]).inc();
+        let blocks = self.get_block_locations(path).await?;
+        cache.put(path, &blocks);
+        Ok(blocks)
+    }
+
     pub async fn get_file_block_details(&self, path: &Path) -> FsResult<FileBlockDetails> {
         let header = GetFileBlockDetailsRequest {
             path: path.encode(),

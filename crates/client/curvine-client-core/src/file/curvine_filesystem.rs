@@ -150,8 +150,11 @@ impl CurvineFileSystem {
         self.fs_client.exists(path).await
     }
 
+    /// Open `path` to read. With `block_location_cache_ttl_ms` set, the
+    /// block locations may come from the client cache rather than the master;
+    /// see [`BlockLocationCache`](crate::file::BlockLocationCache).
     pub async fn open(&self, path: &Path) -> FsResult<FsReader> {
-        let file_blocks = self.fs_client.get_block_locations(path).await?;
+        let file_blocks = self.fs_client.get_read_block_locations(path).await?;
 
         let reader = FsReader::new(path.clone(), self.fs_context.clone(), file_blocks)?;
         Ok(reader)
